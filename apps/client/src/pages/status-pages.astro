@@ -15,48 +15,38 @@ import {
   IconContainer,
   Flex,
   Stack,
-  Container
+  Container,
+  Alert
 } from "$ui";
 
-// Mock data for public status pages
-const statusPages = [
-	{
-		id: '1',
-		title: 'Production API Status',
-		slug: 'production-api',
-		url: 'https://api.example.com',
-		services: ['API Server', 'Database', 'CDN'],
-		uptime: 99.97,
-		visits: 1247,
-		lastIncident: '2024-01-10T08:15:00Z',
-		isActive: true,
-		created: '2024-01-01T00:00:00Z'
-	},
-	{
-		id: '2',
-		title: 'Website Status',
-		slug: 'website-status',
-		url: 'https://example.com',
-		services: ['Web Server', 'Load Balancer'],
-		uptime: 99.85,
-		visits: 856,
-		lastIncident: '2024-01-12T14:23:00Z',
-		isActive: true,
-		created: '2024-01-05T00:00:00Z'
-	},
-	{
-		id: '3',
-		title: 'Internal Tools',
-		slug: 'internal-tools',
-		url: 'https://tools.example.com',
-		services: ['Admin Panel', 'Monitoring Dashboard'],
-		uptime: 98.92,
-		visits: 234,
-		lastIncident: '2024-01-14T16:45:00Z',
-		isActive: false,
-		created: '2024-01-10T00:00:00Z'
-	}
-];
+// Import API client
+import { monitorClient, statusPageClient } from "../lib/api/client";
+import { ListStatusPagesRequest } from "../gen/statuspage/v1/statuspage_pb";
+
+// Fetch monitors to show what can be added to status pages
+let monitors: any[] = [];
+try {
+  const response = await monitorClient.listMonitors({ page: 1, pageSize: 100, filter: '' });
+  monitors = response.monitors || [];
+} catch (error) {
+  console.error('Failed to fetch monitors:', error);
+}
+
+let statusPages: any[] = [];
+try {
+  const response = await statusPageClient.listStatusPages(new ListStatusPagesRequest({ page: 1, pageSize: 50 }));
+  statusPages = response.statusPages || [];
+} catch (error) {
+  console.error('Failed to fetch status pages:', error);
+}
+
+// Calculate stats
+const totalPages = statusPages.length;
+const activePages = statusPages.filter((p: any) => p.isActive).length;
+const totalVisits = statusPages.reduce((sum: number, p: any) => sum + Number(p.visits || 0), 0);
+const avgUptime = statusPages.length > 0 
+  ? (statusPages.reduce((sum: number, p: any) => sum + Number(p.uptime || 0), 0) / statusPages.length).toFixed(1)
+  : '100.0';
 ---
 
 <Layout title="Public Status Pages - Uppe.">
@@ -70,11 +60,20 @@ const statusPages = [
 						<Heading level={1}>Public Status Pages</Heading>
 						<Paragraph color="secondary">Create and manage public status pages for your services</Paragraph>
 					</Stack>
-					<Button variant="primary">
-						Create New Page
+					<Button variant="primary" disabled={true}>
+						Create New Page Soon
 					</Button>
 				</Flex>
 			</Section>
+
+			{monitors.length === 0 && (
+				<Section>
+					<Alert variant="warning">
+						<strong>No monitors configured.</strong> Create some monitors first before setting up status pages.
+					<a href="/add-monitor" class="ml-2 text-accent-primary hover:underline">Create a monitor →</a>
+					</Alert>
+				</Section>
+			)}
 			
 			<!-- Quick Stats -->
 			<Section>
@@ -82,7 +81,7 @@ const statusPages = [
 					<Card>
 						<CardBody>
 							<MetricDisplay 
-								value={statusPages.length}
+								value={totalPages}
 								label="Total Pages"
 								color="primary"
 							/>
@@ -91,7 +90,7 @@ const statusPages = [
 					<Card>
 						<CardBody>
 							<MetricDisplay 
-								value={statusPages.filter(p => p.isActive).length}
+								value={activePages}
 								label="Active Pages"
 								color="success"
 							/>
@@ -100,7 +99,7 @@ const statusPages = [
 					<Card>
 						<CardBody>
 							<MetricDisplay 
-								value={statusPages.reduce((sum, p) => sum + p.visits, 0).toLocaleString()}
+								value={totalVisits.toLocaleString()}
 								label="Total Visits"
 								color="warning"
 							/>
@@ -109,7 +108,7 @@ const statusPages = [
 					<Card>
 						<CardBody>
 							<MetricDisplay 
-								value={`${(statusPages.reduce((sum, p) => sum + p.uptime, 0) / statusPages.length).toFixed(1)}%`}
+								value={`${avgUptime}%`}
 								label="Avg. Uptime"
 								color="primary"
 							/>
@@ -118,40 +117,116 @@ const statusPages = [
 				</Grid>
 			</Section>
 
-		<!-- Status Pages List -->
-		<Section>
-			<Grid cols="2" gap="4">
-				{statusPages.map((page) => (
-					<StatusPageCard
-						title={page.title}
-						slug={page.slug}
-						isActive={page.isActive}
-						services={page.services}
-						uptime={page.uptime}
-						visits={page.visits}
-						lastIncident={page.lastIncident}
-						created={page.created}
-					/>
-				))}
-			</Grid>
-		</Section>
+		{statusPages.length > 0 ? (
+			<!-- Status Pages List -->
+			<Section>
+				<Grid cols="2" gap="4">
+					{statusPages.map((page: any) => (
+						<StatusPageCard
+							title={page.title}
+							slug={page.slug}
+							isActive={page.isActive}
+							services={page.monitorIds.map((id: string) => monitors.find((m: any) => m.id === id)?.name || id)}
+							uptime={page.uptime}
+							visits={Number(page.visits)}
+							lastIncident={Number(page.lastIncident) > 0 ? new Date(Number(page.lastIncident) * 1000).toISOString() : new Date(Number(page.updatedAt) * 1000).toISOString()}
+							created={new Date(Number(page.createdAt) * 1000).toISOString()}
+						/>
+					))}
+				</Grid>
+			</Section>
+		) : (
+			<!-- Empty State / Create First Page CTA -->
+			<Section>
+				<Card>
+					<CardBody padding="xl">
+						<Stack align="center" gap="4">
+							<IconContainer variant="primary" size="lg">
+								<Icon icon="DASHBOARD" class="text-accent-primary" />
+							</IconContainer>
+							<Heading level={3}>Create Your First Status Page</Heading>
+							<Paragraph color="secondary" align="center" class="max-w-md">
+								Status pages let you share your service health with your users. 
+								They automatically update based on your monitor data.
+							</Paragraph>
+							
+							{monitors.length > 0 ? (
+								<Stack gap="2" align="center">
+									<Paragraph color="secondary" class="text-sm">
+										You have {monitors.length} monitor{monitors.length !== 1 ? 's' : ''} that can be added to a status page:
+									</Paragraph>
+									<div class="flex flex-wrap gap-2 justify-center">
+										{monitors.slice(0, 5).map((m: any) => (
+											<span class="px-2 py-1 bg-bg-tertiary rounded text-sm">{m.name}</span>
+										))}
+										{monitors.length > 5 && (
+											<span class="px-2 py-1 bg-bg-tertiary rounded text-sm">+{monitors.length - 5} more</span>
+										)}
+									</div>
+									<Button variant="primary" size="lg" class="mt-4" disabled={true}>
+										Create Status Page Soon
+									</Button>
+								</Stack>
+							) : (
+								<Stack gap="2" align="center">
+									<Paragraph color="secondary" class="text-sm">
+										First, create some monitors to track your services.
+									</Paragraph>
+									<Button variant="primary" size="lg" href="/add-monitor">
+										Create a Monitor
+									</Button>
+								</Stack>
+							)}
+						</Stack>
+					</CardBody>
+				</Card>
+			</Section>
+		)}
 
-		<!-- Create First Page CTA -->
+		<!-- Features Section -->
 		<Section>
-			<Card>
-				<CardBody padding="xl">
-					<Stack align="center" gap="4">
-						<IconContainer variant="primary" size="lg">
-							<Icon icon="DASHBOARD" class="text-accent-primary" />
-						</IconContainer>
-						<Heading level={3}>Ready to go public?</Heading>
-						<Paragraph color="secondary" align="center">Create your first public status page and keep your users informed about your service status.</Paragraph>
-						<Button variant="primary" size="lg">
-							Create Status Page
-						</Button>
-					</Stack>
-				</CardBody>
-			</Card>
+			<Heading level={2} class="mb-4">Status Page Features</Heading>
+			<Grid cols="3" gap="4">
+				<Card>
+					<CardBody>
+						<Stack gap="2">
+							<Flex align="center" gap="2">
+								<Icon icon="GLOBAL" class="size-5 text-accent-primary" />
+								<Heading level={4}>Custom Domain</Heading>
+							</Flex>
+							<Paragraph color="secondary" class="text-sm">
+								Use your own domain for a branded status page experience.
+							</Paragraph>
+						</Stack>
+					</CardBody>
+				</Card>
+				<Card>
+					<CardBody>
+						<Stack gap="2">
+							<Flex align="center" gap="2">
+								<Icon icon="ANALYTICS" class="size-5 text-accent-primary" />
+								<Heading level={4}>Real-time Updates</Heading>
+							</Flex>
+							<Paragraph color="secondary" class="text-sm">
+								Status pages update automatically from your monitor data.
+							</Paragraph>
+						</Stack>
+					</CardBody>
+				</Card>
+				<Card>
+					<CardBody>
+						<Stack gap="2">
+							<Flex align="center" gap="2">
+								<Icon icon="DOCUMENT" class="size-5 text-accent-primary" />
+								<Heading level={4}>Incident Management</Heading>
+							</Flex>
+							<Paragraph color="secondary" class="text-sm">
+								Post updates during incidents to keep users informed.
+							</Paragraph>
+						</Stack>
+					</CardBody>
+				</Card>
+			</Grid>
 		</Section>
 		</Container>
 	</main>

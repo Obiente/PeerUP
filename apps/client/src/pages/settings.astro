@@ -3,7 +3,6 @@ import Header from "$components/Header.astro";
 import Layout from "$layouts/Layout.astro";
 import { 
   Section, 
-  Grid, 
   Card, 
   CardBody, 
   Heading, 
@@ -16,8 +15,48 @@ import {
   Icon,
   Label,
   Alert,
-  Badge
+  Badge,
+  Stack,
+  Flex
 } from "$ui";
+import { settingsClient } from "../lib/api/client";
+import { GetNodeIdentityRequest, GetSettingsRequest, PeerDiscoveryMethod } from "../gen/settings/v1/settings_pb";
+
+const apiBaseUrl = import.meta.env.PUBLIC_API_URL || "http://localhost:8080";
+let settings;
+let nodeIdentity;
+let settingsError: string | null = null;
+
+try {
+  settings = await settingsClient.getSettings(new GetSettingsRequest());
+  nodeIdentity = await settingsClient.getNodeIdentity(new GetNodeIdentityRequest());
+} catch (error) {
+  console.error("[Settings] Failed to fetch settings:", error);
+  settingsError = "Failed to load settings from the API server.";
+}
+
+const account = settings?.account;
+const notifications = settings?.notifications;
+const network = settings?.network;
+const monitoring = settings?.monitoring;
+const cluster = settings?.cluster;
+
+// Get database info for display
+const dbPath = import.meta.env.DATABASE_LIBSQL_PATH || 'shared/data/libsql.db';
+const apiUrlDisplay = apiBaseUrl;
+const joinedAt = nodeIdentity?.joinedNetworkAt ? new Date(Number(nodeIdentity.joinedNetworkAt) * 1000) : null;
+const peerDiscoveryLabel = (() => {
+  switch (network?.discoveryMethod) {
+    case PeerDiscoveryMethod.PEER_DISCOVERY_DHT_ONLY:
+      return "DHT Only";
+    case PeerDiscoveryMethod.PEER_DISCOVERY_BOOTSTRAP_ONLY:
+      return "Bootstrap Only";
+    case PeerDiscoveryMethod.PEER_DISCOVERY_MANUAL:
+      return "Manual Peers";
+    default:
+      return "DHT + Bootstrap";
+  }
+})();
 ---
 
 <Layout title="Settings" description="Configure your Uppe. monitoring settings">
@@ -26,10 +65,54 @@ import {
   <main class="min-h-screen">
     <Section>
       <Heading level={1} class="mb-2">Settings</Heading>
-      <Paragraph class="text-secondary">Configure your monitoring preferences and account settings</Paragraph>
+      <Paragraph class="text-secondary">Configure your monitoring preferences</Paragraph>
     </Section>
 
     <div class="space-y-8">
+      <!-- Node Information -->
+      <Section>
+        <Card>
+          <CardBody>
+            <Heading level={2} class="mb-4">Node Information</Heading>
+            <div class="space-y-4">
+              {settingsError && (
+                <Alert variant="error">
+                  <strong>Settings unavailable.</strong> {settingsError}
+                </Alert>
+              )}
+              {!settingsError && (
+                <Alert variant="info">
+                  <strong>Live API data.</strong> This page now reads settings and node identity from the Go API. Save actions are still pending.
+                </Alert>
+              )}
+              
+              <div class="grid grid-cols-2 gap-4 mt-4">
+                <div class="p-4 bg-bg-tertiary rounded-lg">
+                  <Paragraph color="secondary" class="text-sm mb-1">Node Type</Paragraph>
+                  <Paragraph class="font-medium">Standalone</Paragraph>
+                </div>
+                <div class="p-4 bg-bg-tertiary rounded-lg">
+                  <Paragraph color="secondary" class="text-sm mb-1">Database</Paragraph>
+                  <Paragraph class="font-medium text-sm font-mono">{dbPath}</Paragraph>
+                </div>
+                <div class="p-4 bg-bg-tertiary rounded-lg">
+                  <Paragraph color="secondary" class="text-sm mb-1">API Server</Paragraph>
+                  <Paragraph class="font-medium">{apiUrlDisplay}</Paragraph>
+                </div>
+                <div class="p-4 bg-bg-tertiary rounded-lg">
+                  <Paragraph color="secondary" class="text-sm mb-1">Node ID</Paragraph>
+                  <Paragraph class="font-medium text-sm font-mono">{nodeIdentity?.nodeId || "unknown"}</Paragraph>
+                </div>
+                <div class="p-4 bg-bg-tertiary rounded-lg">
+                  <Paragraph color="secondary" class="text-sm mb-1">Joined Network</Paragraph>
+                  <Paragraph class="font-medium">{joinedAt ? joinedAt.toLocaleDateString() : "unknown"}</Paragraph>
+                </div>
+              </div>
+            </div>
+          </CardBody>
+        </Card>
+      </Section>
+
       <!-- Account Settings -->
       <Section>
         <Card>
@@ -41,15 +124,53 @@ import {
                 <Input 
                   id="displayName"
                   type="text"
-                  value="Uppe. User"
+                  value={account?.displayName || ""}
+                  placeholder="Your node name"
                 />
               </FormGroup>
               <FormGroup>
-                <Label for="email">Email Address</Label>
+                <Label for="email">Email Address (for notifications)</Label>
                 <Input 
                   id="email"
                   type="email"
-                  value="user@example.com"
+                  value={account?.email || ""}
+                  placeholder="user@example.com"
+                />
+                <Paragraph color="secondary" class="text-xs mt-1">
+                  Optional - used for alert notifications when configured
+                </Paragraph>
+              </FormGroup>
+            </div>
+          </CardBody>
+        </Card>
+      </Section>
+
+      <!-- Monitoring Defaults -->
+      <Section>
+        <Card>
+          <CardBody>
+            <Heading level={2} class="mb-4">Monitoring Defaults</Heading>
+            <Paragraph color="secondary" class="mb-4 text-sm">
+              Default settings for new monitors. Individual monitors can override these.
+            </Paragraph>
+            <div class="space-y-4">
+              <FormGroup>
+                <Label for="checkInterval">Default Check Interval</Label>
+                <Select id="checkInterval" value={(monitoring?.defaultIntervalSeconds || 60).toString()}>
+                  <option value="30">30 seconds</option>
+                  <option value="60">1 minute</option>
+                  <option value="300">5 minutes</option>
+                  <option value="600">10 minutes</option>
+                </Select>
+              </FormGroup>
+              <FormGroup>
+                <Label for="timeout">Default Timeout (seconds)</Label>
+                <Input 
+                  id="timeout"
+                  type="number"
+                  value={monitoring?.defaultTimeoutSeconds || 10}
+                  min="5"
+                  max="120"
                 />
               </FormGroup>
             </div>
@@ -61,28 +182,31 @@ import {
       <Section>
         <Card>
           <CardBody>
-            <Heading level={2} class="mb-4">Notification Settings</Heading>
-            <div class="space-y-4">
+            <Flex align="center" justify="between" class="mb-4">
+              <Heading level={2}>Notification Settings</Heading>
+              <Badge variant="secondary">Coming Soon</Badge>
+            </Flex>
+            <div class="space-y-4 opacity-60 pointer-events-none">
               <Toggle 
                 label="Email Notifications"
                 description="Receive alerts when monitors go down"
-                checked={true}
+                checked={notifications?.emailNotifications || false}
                 id="emailNotifications"
                 name="emailNotifications"
               />
               <Toggle 
-                label="Incident Reports"
-                description="Weekly summary of incidents and uptime"
-                checked={false}
+                label="Weekly Reports"
+                description="Weekly summary of uptime and incidents"
+                checked={notifications?.incidentReports || false}
                 id="incidentReports"
                 name="incidentReports"
               />
               <Toggle 
-                label="P2P Network Updates"
-                description="Updates about network status and improvements"
-                checked={true}
-                id="networkUpdates"
-                name="networkUpdates"
+                label="Webhook Notifications"
+                description="Send alerts to external services via webhooks"
+                checked={false}
+                id="webhookNotifications"
+                name="webhookNotifications"
               />
             </div>
           </CardBody>
@@ -93,21 +217,25 @@ import {
       <Section>
         <Card>
           <CardBody>
-            <Heading level={2} class="mb-4">P2P Network Settings</Heading>
-            <div class="space-y-4">
+            <Flex align="center" justify="between" class="mb-4">
+              <Heading level={2}>P2P Network Settings</Heading>
+              <Badge variant="secondary">Coming Soon</Badge>
+            </Flex>
+            <Alert variant="info" class="mb-4">
+              P2P monitoring is under active development. When enabled, your node will join a decentralized 
+              network of monitoring peers for distributed, trust-verified monitoring.
+            </Alert>
+            <div class="space-y-4 opacity-60 pointer-events-none">
               <FormGroup>
                 <Label for="peerDiscovery">Peer Discovery Method</Label>
                 <Select id="peerDiscovery">
-                  <option>DHT + Bootstrap Nodes</option>
-                  <option>DHT Only</option>
-                  <option>Bootstrap Nodes Only</option>
-                  <option>Manual Peer List</option>
+                  <option selected>{peerDiscoveryLabel}</option>
                 </Select>
               </FormGroup>
               <Toggle 
                 label="Contribute to Network"
-                description="Help monitor other services in the network"
-                checked={true}
+                description="Help monitor services for other peers in the network"
+                checked={network?.contributeToNetwork || false}
                 id="contributeToNetwork"
                 name="contributeToNetwork"
               />
@@ -116,61 +244,9 @@ import {
                 <Input 
                   id="maxBandwidth"
                   type="number"
-                  value="100"
+                  value={network?.maxBandwidthMbPerDay ? Number(network.maxBandwidthMbPerDay) : 100}
                 />
               </FormGroup>
-              <FormGroup>
-                <Label for="maxChecks">Max Concurrent Checks</Label>
-                <Input 
-                  id="maxChecks"
-                  type="number"
-                  value="50"
-                  min="1"
-                  max="200"
-                />
-              </FormGroup>
-              <Toggle 
-                label="Auto-Accept Monitoring Requests"
-                description="Automatically accept requests to monitor services"
-                checked={true}
-                id="autoAcceptRequests"
-                name="autoAcceptRequests"
-              />
-            </div>
-          </CardBody>
-        </Card>
-      </Section>
-
-      <!-- Advanced Settings -->
-      <Section>
-        <Card>
-          <CardBody>
-            <Heading class="mb-4">Advanced Settings</Heading>
-            <div class="space-y-4">
-              <FormGroup>
-                <Label for="checkInterval">Check Interval</Label>
-                <Select id="checkInterval">
-                  <option>30 seconds</option>
-                  <option>1 minute</option>
-                  <option>5 minutes</option>
-                  <option>10 minutes</option>
-                </Select>
-              </FormGroup>
-              <FormGroup>
-                <Label for="timeout">Timeout (seconds)</Label>
-                <Input 
-                  id="timeout"
-                  type="number"
-                  value="30"
-                />
-              </FormGroup>
-              <Toggle 
-                label="Detailed Logging"
-                description="Store detailed logs of all monitoring activities"
-                checked={false}
-                id="detailedLogging"
-                name="detailedLogging"
-              />
             </div>
           </CardBody>
         </Card>
@@ -180,71 +256,79 @@ import {
       <Section>
         <Card>
           <CardBody>
-            <Heading level={2} class="mb-4">Cluster Management</Heading>
+            <Flex align="center" justify="between" class="mb-4">
+              <Heading level={2}>Cluster Management</Heading>
+              <Badge variant="secondary">Coming Soon</Badge>
+            </Flex>
+            <Alert variant="info" class="mb-4">
+              Clusters allow groups of nodes to collaborate on monitoring. Create public or private 
+              clusters for team monitoring or join existing clusters.
+            </Alert>
             
-            <div class="space-y-6">
-              <Card class="border-2 border-primary">
-                <CardBody>
-                  <div class="flex items-center justify-between">
-                    <div class="flex-1">
-                      <div class="flex items-center gap-2 mb-2">
-                        <Heading level={3}>Cluster Visibility</Heading>
-                        <Badge variant="primary">Public</Badge>
-                      </div>
-                      <Paragraph class="text-secondary text-sm">
-                        Your monitoring cluster is currently public. Other users can discover and join your cluster for collaborative monitoring.
-                      </Paragraph>
-                    </div>
-                    <div class="ml-4">
-                      <Toggle 
-                        label=""
-                        checked={true}
-                        id="clusterVisibility"
-                        name="clusterVisibility"
-                      />
-                    </div>
-                  </div>
-                </CardBody>
-              </Card>
+            <div class="space-y-4 opacity-60 pointer-events-none">
+              <Toggle 
+                label="Enable Cluster Mode"
+                description="Create or join a monitoring cluster"
+                checked={!!cluster}
+                id="clusterEnabled"
+                name="clusterEnabled"
+              />
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <FormGroup>
+                  <Label for="clusterName">Cluster Name</Label>
+                  <Input 
+                    id="clusterName"
+                    type="text"
+                    value={cluster?.clusterName || ""}
+                    placeholder="My Monitoring Cluster"
+                  />
+                </FormGroup>
+                <FormGroup>
+                  <Label for="clusterVisibility">Visibility</Label>
+                  <Select id="clusterVisibility">
+                    <option value={cluster?.isPublic ? "public" : "private"}>
+                      {cluster?.isPublic ? "Public" : "Private"}
+                    </option>
+                  </Select>
+                </FormGroup>
+              </div>
+            </div>
+          </CardBody>
+        </Card>
+      </Section>
 
-              <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                <div class="space-y-4">
-                  <FormGroup>
-                    <Label for="clusterName">Cluster Name</Label>
-                    <Input 
-                      id="clusterName"
-                      type="text"
-                      value="My Monitoring Cluster"
-                    />
-                  </FormGroup>
-                  <FormGroup>
-                    <Label for="maxClusterSize">Max Cluster Size</Label>
-                    <Select id="maxClusterSize">
-                      <option value="10">10 peers</option>
-                      <option value="25" selected>25 peers</option>
-                      <option value="50">50 peers</option>
-                      <option value="100">100 peers</option>
-                    </Select>
-                  </FormGroup>
-                </div>
-                <div class="space-y-4">
-                  <FormGroup>
-                    <Label for="joinPolicy">Join Policy</Label>
-                    <Select id="joinPolicy">
-                      <option value="open" selected>Open (Anyone can join)</option>
-                      <option value="approval">Approval Required</option>
-                      <option value="invite">Invite Only</option>
-                    </Select>
-                  </FormGroup>
-                  <FormGroup>
-                    <Label for="minMRScore">Minimum MR Score</Label>
-                    <Select id="minMRScore">
-                      <option value="0">No minimum</option>
-                      <option value="1">1.0 (Balanced)</option>
-                      <option value="1.5" selected>1.5 (Good contributor)</option>
-                      <option value="2">2.0 (Excellent contributor)</option>
-                    </Select>
-                  </FormGroup>
+      <!-- Data Management -->
+      <Section>
+        <Card>
+          <CardBody>
+            <Heading level={2} class="mb-4">Data Management</Heading>
+            <div class="space-y-4">
+              <FormGroup>
+                <Label for="dataRetention">Data Retention Period</Label>
+                <Select id="dataRetention" value={(monitoring?.resultRetentionDays || 30).toString()}>
+                  <option value="7">7 days</option>
+                  <option value="30">30 days</option>
+                  <option value="90">90 days</option>
+                  <option value="365">1 year</option>
+                  <option value="0">Forever</option>
+                </Select>
+                <Paragraph color="secondary" class="text-xs mt-1">
+                  How long to keep monitor results and historical data
+                </Paragraph>
+              </FormGroup>
+              
+              <div class="pt-4 border-t border-border-primary">
+                <Heading level={4} class="mb-2">Danger Zone</Heading>
+                <div class="flex items-center justify-between p-4 border border-red-500/30 rounded-lg bg-red-500/5">
+                  <div>
+                    <Paragraph class="font-medium">Clear All Data</Paragraph>
+                    <Paragraph color="secondary" class="text-sm">
+                      Delete all monitors, results, and settings. This cannot be undone.
+                    </Paragraph>
+                  </div>
+                  <Button variant="danger" size="sm">
+                    Clear Data
+                  </Button>
                 </div>
               </div>
             </div>
@@ -254,10 +338,13 @@ import {
 
       <!-- Save Button -->
       <Section>
-        <div class="flex justify-end">
-          <Button variant="primary" class="flex items-center gap-2">
+        <div class="flex justify-end gap-4">
+          <Button variant="secondary" disabled>
+            Reset to Defaults
+          </Button>
+          <Button variant="primary" class="flex items-center gap-2" disabled>
             <Icon icon="CONFIRM" />
-            Save Settings
+            Save Settings Soon
           </Button>
         </div>
       </Section>
