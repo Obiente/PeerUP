@@ -3,6 +3,7 @@ use std::path;
 
 use clap::{Parser, Subcommand, crate_authors, crate_version};
 
+mod audit;
 mod config;
 mod crypto;
 mod database;

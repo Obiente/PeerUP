@@ -2,7 +2,7 @@ use anyhow::Result;
 use libsql::Connection;
 
 /// Schema version - increment when making schema changes
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 /// Run database migrations
 ///
@@ -48,12 +48,19 @@ pub async fn run_migrations(conn: &Connection) -> Result<()> {
 
     if current_version < 4 {
         run_migration_v4(conn).await?;
-        record_migration(conn, 4, "Add public/private monitor visibility and orchestration fields").await?;
+        record_migration(conn, 4, "Add public/private monitor visibility and orchestration fields")
+            .await?;
     }
 
     if current_version < 5 {
         run_migration_v5(conn).await?;
-        record_migration(conn, 5, "Add retention_until and P2P sync columns to peer_results").await?;
+        record_migration(conn, 5, "Add retention_until and P2P sync columns to peer_results")
+            .await?;
+    }
+
+    if current_version < 6 {
+        run_migration_v6(conn).await?;
+        record_migration(conn, 6, "Add signed audit event and attestation tables").await?;
     }
 
     tracing::info!(
@@ -259,6 +266,77 @@ async fn run_migration_v2(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Migration v6: Add signed audit event and attestation tables
+async fn run_migration_v6(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS audit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_uuid TEXT NOT NULL UNIQUE,
+            event_type TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            actor_id TEXT NOT NULL,
+            actor_public_key BLOB NOT NULL,
+            resource_type TEXT NOT NULL,
+            resource_id TEXT NOT NULL,
+            parent_event_uuid TEXT,
+            payload_json TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            capability_id TEXT,
+            delegated_by TEXT,
+            expires_at INTEGER,
+            context_json TEXT,
+            signature BLOB NOT NULL
+        )",
+        (),
+    )
+    .await?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS audit_attestations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            attestation_uuid TEXT NOT NULL UNIQUE,
+            subject_event_uuid TEXT NOT NULL,
+            attestor_id TEXT NOT NULL,
+            attestor_public_key BLOB NOT NULL,
+            decision TEXT NOT NULL,
+            reason TEXT,
+            created_at INTEGER NOT NULL,
+            signature BLOB NOT NULL,
+            FOREIGN KEY (subject_event_uuid) REFERENCES audit_events(event_uuid) ON DELETE CASCADE
+        )",
+        (),
+    )
+    .await?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_events_created_at ON audit_events(created_at DESC)",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_events_resource ON audit_events(resource_type, \
+         resource_id, created_at DESC)",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events(actor_id, created_at \
+         DESC)",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_attestations_subject ON \
+         audit_attestations(subject_event_uuid, created_at DESC)",
+        (),
+    )
+    .await?;
+
+    tracing::info!("Added audit event and attestation tables");
+    Ok(())
+}
+
 /// Migration v3: Add status pages, settings, incidents, and network tables
 async fn run_migration_v3(conn: &Connection) -> Result<()> {
     // ============================================================
@@ -461,40 +539,23 @@ async fn run_migration_v4(conn: &Connection) -> Result<()> {
     tracing::info!("Running migration v4: Add monitor visibility fields");
 
     // Add visibility columns to monitors table
-    conn.execute(
-        "ALTER TABLE monitors ADD COLUMN visibility TEXT NOT NULL DEFAULT 'Private'",
-        (),
-    )
-    .await?;
+    conn.execute("ALTER TABLE monitors ADD COLUMN visibility TEXT NOT NULL DEFAULT 'Private'", ())
+        .await?;
 
-    conn.execute(
-        "ALTER TABLE monitors ADD COLUMN public_domain TEXT",
-        (),
-    )
-    .await?;
+    conn.execute("ALTER TABLE monitors ADD COLUMN public_domain TEXT", ()).await?;
 
-    conn.execute(
-        "ALTER TABLE monitors ADD COLUMN public_display_name TEXT",
-        (),
-    )
-    .await?;
+    conn.execute("ALTER TABLE monitors ADD COLUMN public_display_name TEXT", ())
+        .await?;
 
-    conn.execute(
-        "ALTER TABLE monitors ADD COLUMN owner_peer_id TEXT",
-        (),
-    )
-    .await?;
+    conn.execute("ALTER TABLE monitors ADD COLUMN owner_peer_id TEXT", ()).await?;
 
     // Create indexes for visibility queries
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_monitors_visibility ON monitors(visibility)",
-        (),
-    )
-    .await?;
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_monitors_visibility ON monitors(visibility)", ())
+        .await?;
 
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_monitors_public_domain ON monitors(public_domain) \
-         WHERE public_domain IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_monitors_public_domain ON monitors(public_domain) WHERE \
+         public_domain IS NOT NULL",
         (),
     )
     .await?;
@@ -543,14 +604,14 @@ async fn run_migration_v4(conn: &Connection) -> Result<()> {
 /// Migration v5: Add retention_until and P2P sync columns to peer_results
 /// For databases upgraded from earlier versions that may be missing these columns
 async fn run_migration_v5(conn: &Connection) -> Result<()> {
-    tracing::info!("Running migration v5: Add retention_until and P2P sync columns to peer_results");
+    tracing::info!(
+        "Running migration v5: Add retention_until and P2P sync columns to peer_results"
+    );
 
     // Add source_peer_id column if it doesn't exist
-    match conn.execute(
-        "ALTER TABLE peer_results ADD COLUMN source_peer_id TEXT",
-        (),
-    )
-    .await
+    match conn
+        .execute("ALTER TABLE peer_results ADD COLUMN source_peer_id TEXT", ())
+        .await
     {
         Ok(_) => tracing::debug!("Added source_peer_id column"),
         Err(e) if e.to_string().contains("duplicate column") => {
@@ -560,11 +621,9 @@ async fn run_migration_v5(conn: &Connection) -> Result<()> {
     }
 
     // Add synced_from_peer column if it doesn't exist
-    match conn.execute(
-        "ALTER TABLE peer_results ADD COLUMN synced_from_peer INTEGER DEFAULT 0",
-        (),
-    )
-    .await
+    match conn
+        .execute("ALTER TABLE peer_results ADD COLUMN synced_from_peer INTEGER DEFAULT 0", ())
+        .await
     {
         Ok(_) => tracing::debug!("Added synced_from_peer column"),
         Err(e) if e.to_string().contains("duplicate column") => {
@@ -574,11 +633,9 @@ async fn run_migration_v5(conn: &Connection) -> Result<()> {
     }
 
     // Add retention_until column if it doesn't exist
-    match conn.execute(
-        "ALTER TABLE peer_results ADD COLUMN retention_until INTEGER",
-        (),
-    )
-    .await
+    match conn
+        .execute("ALTER TABLE peer_results ADD COLUMN retention_until INTEGER", ())
+        .await
     {
         Ok(_) => tracing::debug!("Added retention_until column"),
         Err(e) if e.to_string().contains("duplicate column") => {

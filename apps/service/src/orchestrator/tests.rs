@@ -13,11 +13,11 @@ use crate::pool::{LibsqlManager, LibsqlPool};
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 use uuid::Uuid;
 
 /// Helper to create test database pool
-async fn create_test_database() -> Result<(LibsqlPool, String)> {
+async fn create_test_database() -> Result<(TempDir, LibsqlPool, String)> {
     let temp_dir = tempdir()?;
     let db_path = temp_dir.path().join("test.db");
     let db_path_str = db_path.to_string_lossy().to_string();
@@ -32,7 +32,7 @@ async fn create_test_database() -> Result<(LibsqlPool, String)> {
     let conn: deadpool::managed::Object<LibsqlManager> = pool.get().await?;
     crate::database::initialize_database(&*conn).await?;
 
-    Ok((pool, db_path_str))
+    Ok((temp_dir, pool, db_path_str))
 }
 
 /// Helper to create test keypair
@@ -52,24 +52,19 @@ fn create_test_p2p_network(peer_id: String, public_key: [u8; 32]) -> Arc<P2PNetw
         .build();
 
     Arc::new(P2PNetwork::with_config(
-        peer_id,
-        false, // Disabled for unit tests
-        public_key,
-        config,
+        peer_id, false, // Disabled for unit tests
+        public_key, config,
     ))
 }
 
 #[tokio::test]
 async fn test_retention_policy_integration() -> Result<()> {
-    let (pool, _db_path) = create_test_database().await?;
+    let (_temp_dir, pool, _db_path) = create_test_database().await?;
     let database = Arc::new(DatabaseImpl::new_from_pool(pool));
 
     // Create custom retention policy: 1 second for all types
-    let policy = RetentionPolicy {
-        private_result_days: 0,
-        public_result_days: 0,
-        peer_result_days: 0,
-    };
+    let policy =
+        RetentionPolicy { private_result_days: 0, public_result_days: 0, peer_result_days: 0 };
 
     let cleanup = RetentionCleanup::new(database.clone(), policy);
 
@@ -82,7 +77,7 @@ async fn test_retention_policy_integration() -> Result<()> {
         latency_ms: Some(100),
         status_code: Some(200),
         error_message: None,
-        timestamp: SystemTime::now() - Duration::from_secs(7 * 24 * 3600 + 3600), // 7 days + 1 hour ago
+        timestamp: SystemTime::now() - Duration::from_secs(7 * 24 * 3600 + 3600), /* 7 days + 1 hour ago */
         verified: true,
         signature: vec![0u8; 64],
         created_at: SystemTime::now(),
@@ -108,7 +103,7 @@ async fn test_retention_policy_integration() -> Result<()> {
 
 #[tokio::test]
 async fn test_private_orchestrator_creation() -> Result<()> {
-    let (pool, _db_path) = create_test_database().await?;
+    let (_temp_dir, pool, _db_path) = create_test_database().await?;
     let database = Arc::new(DatabaseImpl::new_from_pool(pool));
     let keypair = create_test_keypair();
     let peer_id = keypair.public_key_hex();
@@ -116,12 +111,8 @@ async fn test_private_orchestrator_creation() -> Result<()> {
     let p2p_network = create_test_p2p_network(peer_id.clone(), keypair.public_key_bytes());
 
     // Create private orchestrator
-    let _orchestrator = PrivateMonitorOrchestrator::new(
-        database.clone(),
-        peer_id,
-        owner_pubkey,
-        p2p_network,
-    );
+    let _orchestrator =
+        PrivateMonitorOrchestrator::new(database.clone(), peer_id, owner_pubkey, p2p_network);
 
     // Verify creation succeeds (orchestrator should be functional)
     Ok(())
@@ -129,7 +120,7 @@ async fn test_private_orchestrator_creation() -> Result<()> {
 
 #[tokio::test]
 async fn test_owner_sync_with_empty_dht() -> Result<()> {
-    let (pool, _db_path) = create_test_database().await?;
+    let (_temp_dir, pool, _db_path) = create_test_database().await?;
     let database = Arc::new(DatabaseImpl::new_from_pool(pool));
     let keypair = create_test_keypair();
     let peer_id = keypair.public_key_hex();
@@ -137,12 +128,8 @@ async fn test_owner_sync_with_empty_dht() -> Result<()> {
     let owner_secret_key = keypair.x25519_secret_bytes();
     let p2p_network = create_test_p2p_network(peer_id.clone(), keypair.public_key_bytes());
 
-    let orchestrator = PrivateMonitorOrchestrator::new(
-        database.clone(),
-        peer_id,
-        owner_pubkey,
-        p2p_network,
-    );
+    let orchestrator =
+        PrivateMonitorOrchestrator::new(database.clone(), peer_id, owner_pubkey, p2p_network);
 
     // Sync with empty DHT should complete without error (no monitors, no assignments)
     // This tests the graceful handling of "no data" scenario
@@ -161,7 +148,7 @@ async fn test_owner_sync_with_empty_dht() -> Result<()> {
 
 #[tokio::test]
 async fn test_retention_cleanup_with_recent_results() -> Result<()> {
-    let (pool, _db_path) = create_test_database().await?;
+    let (_temp_dir, pool, _db_path) = create_test_database().await?;
     let database = Arc::new(DatabaseImpl::new_from_pool(pool));
 
     // Default policy: 7 days for private, 30 for public/peer
@@ -232,10 +219,8 @@ async fn test_encryption_roundtrip_integration() -> Result<()> {
     )?;
 
     // Decrypt using the owner's X25519 secret key — this is the critical roundtrip
-    let decrypted: CheckResult = decrypt_result_for_owner(
-        &encrypted,
-        &owner_keypair.x25519_secret_bytes(),
-    )?;
+    let decrypted: CheckResult =
+        decrypt_result_for_owner(&encrypted, &owner_keypair.x25519_secret_bytes())?;
 
     assert_eq!(decrypted.monitor_id, check_result.monitor_id);
     assert_eq!(decrypted.target, check_result.target);
@@ -249,7 +234,7 @@ async fn test_encryption_roundtrip_integration() -> Result<()> {
 
 #[tokio::test]
 async fn test_retention_periodic_cleanup_starts() -> Result<()> {
-    let (pool, _db_path) = create_test_database().await?;
+    let (_temp_dir, pool, _db_path) = create_test_database().await?;
     let database = Arc::new(DatabaseImpl::new_from_pool(pool));
 
     let policy = RetentionPolicy::default();
@@ -273,28 +258,24 @@ mod helper_assignment_tests {
 
     #[tokio::test]
     async fn test_helper_assignment_flow() -> Result<()> {
-        let (pool, _db_path) = create_test_database().await?;
+        let (_temp_dir, pool, _db_path) = create_test_database().await?;
         let database = Arc::new(DatabaseImpl::new_from_pool(pool));
         let keypair = create_test_keypair();
         let peer_id = keypair.public_key_hex();
         let owner_pubkey = keypair.x25519_public_key();
         let p2p_network = create_test_p2p_network(peer_id.clone(), keypair.public_key_bytes());
 
-        let _orchestrator = PrivateMonitorOrchestrator::new(
-            database.clone(),
-            peer_id,
-            owner_pubkey,
-            p2p_network,
-        );
+        let _orchestrator =
+            PrivateMonitorOrchestrator::new(database.clone(), peer_id, owner_pubkey, p2p_network);
 
         // Test helper assignment logic
         // Create a private monitor
-        let mut monitor = crate::database::models::Monitor::new_private(
+        let mut monitor = crate::database::models::Monitor::new(
             "Private Test".to_string(),
             "https://internal.example.com".to_string(),
             "https".to_string(),
-            keypair.public_key_hex(),
         );
+        monitor.owner_peer_id = Some(keypair.public_key_hex());
         monitor.enabled = true;
 
         let _monitor_id = database.save_monitor(&monitor).await?;

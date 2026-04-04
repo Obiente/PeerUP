@@ -5,7 +5,7 @@ use libsql::{Connection, params};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use super::models::{Monitor, MonitorResult, NetworkStats, Peer, PeerResult};
+use super::models::{AuditEvent, Monitor, MonitorResult, NetworkStats, Peer, PeerResult};
 use crate::monitoring::types::CheckResult;
 use crate::pool::LibsqlPool;
 
@@ -67,7 +67,11 @@ pub trait Database: Send + Sync {
     ) -> Result<Vec<PeerResult>>;
 
     /// Mark peer results as synced (for cleanup)
-    async fn mark_peer_results_synced(&self, source_peer_id: &str, until_timestamp: i64) -> Result<()>;
+    async fn mark_peer_results_synced(
+        &self,
+        source_peer_id: &str,
+        until_timestamp: i64,
+    ) -> Result<()>;
 
     /// Clean up expired peer results based on retention policy
     async fn cleanup_expired_peer_results(&self) -> Result<u64>;
@@ -103,6 +107,15 @@ pub trait Database: Send + Sync {
 
     /// Set a setting value by key
     async fn set_setting(&self, key: &str, value: &str) -> Result<()>;
+
+    /// Persist a signed audit event.
+    async fn save_audit_event(&self, event: &AuditEvent) -> Result<i64>;
+
+    /// Fetch a signed audit event by its UUID.
+    async fn get_audit_event(&self, event_uuid: Uuid) -> Result<Option<AuditEvent>>;
+
+    /// List recent signed audit events.
+    async fn list_audit_events(&self, limit: usize) -> Result<Vec<AuditEvent>>;
 }
 
 /// LibSQL database implementation
@@ -128,17 +141,44 @@ impl DatabaseImpl {
     async fn get_conn(&self) -> Result<deadpool::managed::Object<crate::pool::LibsqlManager>> {
         Ok(self.pool.get().await?)
     }
+
+    fn map_audit_event_row(row: &libsql::Row) -> Result<AuditEvent> {
+        let event_uuid: String = row.get(1)?;
+        let created_at: i64 = row.get(4)?;
+        let parent_event_uuid: Option<String> = row.get(9)?;
+        let expires_at: Option<i64> = row.get(14)?;
+
+        Ok(AuditEvent {
+            id: Some(row.get(0)?),
+            event_uuid: Uuid::parse_str(&event_uuid)?,
+            event_type: row.get(2)?,
+            schema_version: row.get(3)?,
+            created_at: Monitor::i64_to_timestamp(created_at),
+            actor_id: row.get(5)?,
+            actor_public_key: row.get(6)?,
+            resource_type: row.get(7)?,
+            resource_id: row.get(8)?,
+            parent_event_uuid: parent_event_uuid.as_deref().map(Uuid::parse_str).transpose()?,
+            payload_json: row.get(10)?,
+            payload_hash: row.get(11)?,
+            capability_id: row.get(12)?,
+            delegated_by: row.get(13)?,
+            expires_at: expires_at.map(Monitor::i64_to_timestamp),
+            context_json: row.get(15)?,
+            signature: row.get(16)?,
+        })
+    }
 }
 
 #[async_trait]
 impl Database for DatabaseImpl {
     async fn get_enabled_monitors(&self) -> Result<Vec<Monitor>> {
         let conn = self.get_conn().await?;
-        let mut stmt = conn
+        let stmt = conn
             .prepare(
                 "SELECT id, uuid, name, target, check_type, interval_seconds, timeout_seconds, \
-                 enabled, created_at, updated_at, visibility, public_domain, \
-                 public_display_name, owner_peer_id FROM monitors WHERE enabled = 1",
+                 enabled, created_at, updated_at, visibility, public_domain, public_display_name, \
+                 owner_peer_id FROM monitors WHERE enabled = 1",
             )
             .await?;
 
@@ -180,11 +220,11 @@ impl Database for DatabaseImpl {
 
     async fn get_monitor_by_uuid(&self, uuid: Uuid) -> Result<Option<Monitor>> {
         let conn = self.get_conn().await?;
-        let mut stmt = conn
+        let stmt = conn
             .prepare(
                 "SELECT id, uuid, name, target, check_type, interval_seconds, timeout_seconds, \
-                 enabled, created_at, updated_at, visibility, public_domain, \
-                 public_display_name, owner_peer_id FROM monitors WHERE uuid = ?",
+                 enabled, created_at, updated_at, visibility, public_domain, public_display_name, \
+                 owner_peer_id FROM monitors WHERE uuid = ?",
             )
             .await?;
 
@@ -239,8 +279,8 @@ impl Database for DatabaseImpl {
             // Update existing monitor
             conn.execute(
                 "UPDATE monitors SET name = ?, target = ?, check_type = ?, interval_seconds = ?, \
-                 timeout_seconds = ?, enabled = ?, updated_at = ?, visibility = ?, \
-                 public_domain = ?, public_display_name = ?, owner_peer_id = ? WHERE id = ?",
+                 timeout_seconds = ?, enabled = ?, updated_at = ?, visibility = ?, public_domain \
+                 = ?, public_display_name = ?, owner_peer_id = ? WHERE id = ?",
                 params![
                     monitor.name.clone(),
                     monitor.target.clone(),
@@ -262,9 +302,9 @@ impl Database for DatabaseImpl {
             // Insert new monitor
             conn.execute(
                 "INSERT INTO monitors (uuid, name, target, check_type, interval_seconds, \
-                 timeout_seconds, enabled, created_at, updated_at, visibility, \
-                 public_domain, public_display_name, owner_peer_id) VALUES (?, ?, ?, ?, ?, ?, ?, \
-                 ?, ?, ?, ?, ?, ?)",
+                 timeout_seconds, enabled, created_at, updated_at, visibility, public_domain, \
+                 public_display_name, owner_peer_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                 ?)",
                 params![
                     monitor.uuid.to_string(),
                     monitor.name.clone(),
@@ -374,7 +414,7 @@ impl Database for DatabaseImpl {
         limit: usize,
     ) -> Result<Vec<MonitorResult>> {
         let conn = self.get_conn().await?;
-        let mut stmt = conn
+        let stmt = conn
             .prepare(
                 "SELECT id, monitor_uuid, timestamp, status, latency_ms, status_code, \
                  error_message, peer_id, signature, created_at, city, country, region FROM \
@@ -418,7 +458,7 @@ impl Database for DatabaseImpl {
 
     async fn get_peer_results(&self, monitor_uuid: Uuid, limit: usize) -> Result<Vec<PeerResult>> {
         let conn = self.get_conn().await?;
-        let mut stmt = conn
+        let stmt = conn
             .prepare(
                 "SELECT id, monitor_uuid, timestamp, status, latency_ms, status_code, \
                  error_message, peer_id, signature, verified, created_at FROM peer_results WHERE \
@@ -508,16 +548,17 @@ impl Database for DatabaseImpl {
 
     async fn get_peer_by_id(&self, peer_id: &str) -> Result<Option<Peer>> {
         let conn = self.get_conn().await?;
-        
+
         let mut rows = conn
             .query(
                 "SELECT peer_id, status, last_seen, joined_at, contribution_score, \
-                 uptime_percentage, checks_per_day, location_city, location_region, location_country
+                 uptime_percentage, checks_per_day, location_city, location_region, \
+                 location_country
                  FROM peers WHERE peer_id = ?",
                 params![peer_id],
             )
             .await?;
-        
+
         if let Some(row) = rows.next().await? {
             let peer_id: String = row.get(0)?;
             let status: String = row.get(1)?;
@@ -529,10 +570,10 @@ impl Database for DatabaseImpl {
             let location_city: Option<String> = row.get(7)?;
             let location_region: Option<String> = row.get(8)?;
             let location_country: Option<String> = row.get(9)?;
-            
+
             let last_seen = Monitor::i64_to_timestamp(last_seen_i64);
             let joined_at = Monitor::i64_to_timestamp(joined_at_i64);
-            
+
             Ok(Some(Peer {
                 peer_id,
                 status,
@@ -553,11 +594,11 @@ impl Database for DatabaseImpl {
     async fn list_peers(&self, limit: usize) -> Result<Vec<Peer>> {
         let conn = self.get_conn().await?;
 
-        let mut stmt = conn
+        let stmt = conn
             .prepare(
                 "SELECT peer_id, status, last_seen, joined_at, contribution_score, \
-                 uptime_percentage, checks_per_day, location_city, location_region, location_country\
-                 FROM peers ORDER BY last_seen DESC LIMIT ?",
+                 uptime_percentage, checks_per_day, location_city, location_region, \
+                 location_countryFROM peers ORDER BY last_seen DESC LIMIT ?",
             )
             .await?;
 
@@ -617,7 +658,7 @@ impl Database for DatabaseImpl {
 
     async fn get_latest_network_stats(&self) -> Result<Option<NetworkStats>> {
         let conn = self.get_conn().await?;
-        let mut stmt = conn
+        let stmt = conn
             .prepare(
                 "SELECT timestamp, total_peers, online_peers, checks_performed, checks_received, \
                  bandwidth_used_mb
@@ -649,16 +690,14 @@ impl Database for DatabaseImpl {
         limit: usize,
     ) -> Result<Vec<PeerResult>> {
         let conn = self.get_conn().await?;
-        
+
         let (query, _params_list): (String, Vec<String>) = if let Some(uuid) = monitor_uuid {
             (
                 format!(
                     "SELECT id, monitor_uuid, timestamp, status, latency_ms, status_code, \
                      error_message, peer_id, signature, verified, created_at, city, country, \
-                     region, source_peer_id, synced_from_peer, retention_until \
-                     FROM peer_results \
-                     WHERE timestamp > ? AND monitor_uuid = ? \
-                     ORDER BY timestamp DESC LIMIT {}",
+                     region, source_peer_id, synced_from_peer, retention_until FROM peer_results \
+                     WHERE timestamp > ? AND monitor_uuid = ? ORDER BY timestamp DESC LIMIT {}",
                     limit
                 ),
                 vec![since_timestamp.to_string(), uuid.to_string()],
@@ -668,18 +707,16 @@ impl Database for DatabaseImpl {
                 format!(
                     "SELECT id, monitor_uuid, timestamp, status, latency_ms, status_code, \
                      error_message, peer_id, signature, verified, created_at, city, country, \
-                     region, source_peer_id, synced_from_peer, retention_until \
-                     FROM peer_results \
-                     WHERE timestamp > ? \
-                     ORDER BY timestamp DESC LIMIT {}",
+                     region, source_peer_id, synced_from_peer, retention_until FROM peer_results \
+                     WHERE timestamp > ? ORDER BY timestamp DESC LIMIT {}",
                     limit
                 ),
                 vec![since_timestamp.to_string()],
             )
         };
 
-        let mut stmt = conn.prepare(&query).await?;
-        
+        let stmt = conn.prepare(&query).await?;
+
         let mut rows = if let Some(uuid) = monitor_uuid {
             stmt.query(params![since_timestamp, uuid.to_string()]).await?
         } else {
@@ -725,12 +762,16 @@ impl Database for DatabaseImpl {
         Ok(results)
     }
 
-    async fn mark_peer_results_synced(&self, source_peer_id: &str, until_timestamp: i64) -> Result<()> {
+    async fn mark_peer_results_synced(
+        &self,
+        source_peer_id: &str,
+        until_timestamp: i64,
+    ) -> Result<()> {
         let conn = self.get_conn().await?;
 
         conn.execute(
-            "UPDATE peer_results SET synced_from_peer = 1 \
-             WHERE source_peer_id = ? AND timestamp <= ?",
+            "UPDATE peer_results SET synced_from_peer = 1 WHERE source_peer_id = ? AND timestamp \
+             <= ?",
             params![source_peer_id, until_timestamp],
         )
         .await?;
@@ -747,9 +788,8 @@ impl Database for DatabaseImpl {
 
         let result = conn
             .execute(
-                "DELETE FROM peer_results \
-                 WHERE retention_until IS NOT NULL AND retention_until < ? \
-                 AND synced_from_peer = 1",
+                "DELETE FROM peer_results WHERE retention_until IS NOT NULL AND retention_until < \
+                 ? AND synced_from_peer = 1",
                 params![now],
             )
             .await?;
@@ -765,12 +805,10 @@ impl Database for DatabaseImpl {
     ) -> Result<Option<peerup::distributed::PublicMonitorGroup>> {
         let conn = self.get_conn().await?;
 
-        let mut stmt = conn
+        let stmt = conn
             .prepare(
-                "SELECT domain, display_name, participating_peers, schedule_json, \
-                 total_checks, created_at, last_updated \
-                 FROM public_monitor_groups \
-                 WHERE domain = ?",
+                "SELECT domain, display_name, participating_peers, schedule_json, total_checks, \
+                 created_at, last_updated FROM public_monitor_groups WHERE domain = ?",
             )
             .await?;
 
@@ -780,8 +818,7 @@ impl Database for DatabaseImpl {
             let participating_peers_json: String = row.get(2)?;
             let schedule_json: String = row.get(3)?;
 
-            let participating_peers: Vec<String> =
-                serde_json::from_str(&participating_peers_json)?;
+            let participating_peers: Vec<String> = serde_json::from_str(&participating_peers_json)?;
             let schedule: peerup::distributed::OrchestrationSchedule =
                 serde_json::from_str(&schedule_json)?;
 
@@ -811,16 +848,12 @@ impl Database for DatabaseImpl {
         let schedule_json = serde_json::to_string(&group.schedule)?;
 
         conn.execute(
-            "INSERT INTO public_monitor_groups \
-             (domain, display_name, participating_peers, schedule_json, \
-              total_checks, created_at, last_updated) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(domain) DO UPDATE SET \
-             display_name = excluded.display_name, \
-             participating_peers = excluded.participating_peers, \
-             schedule_json = excluded.schedule_json, \
-             total_checks = excluded.total_checks, \
-             last_updated = excluded.last_updated",
+            "INSERT INTO public_monitor_groups (domain, display_name, participating_peers, \
+             schedule_json, total_checks, created_at, last_updated) VALUES (?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(domain) DO UPDATE SET display_name = excluded.display_name, \
+             participating_peers = excluded.participating_peers, schedule_json = \
+             excluded.schedule_json, total_checks = excluded.total_checks, last_updated = \
+             excluded.last_updated",
             params![
                 group.domain.clone(),
                 group.display_name.clone(),
@@ -842,12 +875,10 @@ impl Database for DatabaseImpl {
     ) -> Result<Vec<peerup::distributed::OrchestrationVote>> {
         let conn = self.get_conn().await?;
 
-        let mut stmt = conn
+        let stmt = conn
             .prepare(
-                "SELECT domain, voter_peer_id, schedule_json, signature, timestamp \
-                 FROM orchestration_votes \
-                 WHERE domain = ? \
-                 ORDER BY timestamp DESC",
+                "SELECT domain, voter_peer_id, schedule_json, signature, timestamp FROM \
+                 orchestration_votes WHERE domain = ? ORDER BY timestamp DESC",
             )
             .await?;
 
@@ -881,13 +912,10 @@ impl Database for DatabaseImpl {
         let schedule_json = serde_json::to_string(&vote.schedule)?;
 
         conn.execute(
-            "INSERT INTO orchestration_votes \
-             (domain, voter_peer_id, schedule_json, signature, timestamp) \
-             VALUES (?, ?, ?, ?, ?) \
-             ON CONFLICT(domain, voter_peer_id) DO UPDATE SET \
-             schedule_json = excluded.schedule_json, \
-             signature = excluded.signature, \
-             timestamp = excluded.timestamp",
+            "INSERT INTO orchestration_votes (domain, voter_peer_id, schedule_json, signature, \
+             timestamp) VALUES (?, ?, ?, ?, ?) ON CONFLICT(domain, voter_peer_id) DO UPDATE SET \
+             schedule_json = excluded.schedule_json, signature = excluded.signature, timestamp = \
+             excluded.timestamp",
             params![
                 vote.domain.clone(),
                 vote.voter_peer_id.clone(),
@@ -903,12 +931,7 @@ impl Database for DatabaseImpl {
 
     async fn get_setting(&self, key: &str) -> Result<Option<String>> {
         let conn = self.get_conn().await?;
-        let mut rows = conn
-            .query(
-                "SELECT value FROM settings WHERE key = ?",
-                params![key],
-            )
-            .await?;
+        let mut rows = conn.query("SELECT value FROM settings WHERE key = ?", params![key]).await?;
 
         if let Some(row) = rows.next().await? {
             let value: String = row.get(0)?;
@@ -922,11 +945,130 @@ impl Database for DatabaseImpl {
         let conn = self.get_conn().await?;
         let now = crate::database::models::Monitor::timestamp_to_i64(std::time::SystemTime::now());
         conn.execute(
-            "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO \
+             UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             params![key, value, now],
         )
         .await?;
         Ok(())
+    }
+
+    async fn save_audit_event(&self, event: &AuditEvent) -> Result<i64> {
+        let conn = self.get_conn().await?;
+
+        conn.execute(
+            "INSERT INTO audit_events (
+                event_uuid,
+                event_type,
+                schema_version,
+                created_at,
+                actor_id,
+                actor_public_key,
+                resource_type,
+                resource_id,
+                parent_event_uuid,
+                payload_json,
+                payload_hash,
+                capability_id,
+                delegated_by,
+                expires_at,
+                context_json,
+                signature
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                event.event_uuid.to_string(),
+                event.event_type.clone(),
+                event.schema_version,
+                Monitor::timestamp_to_i64(event.created_at),
+                event.actor_id.clone(),
+                event.actor_public_key.clone(),
+                event.resource_type.clone(),
+                event.resource_id.clone(),
+                event.parent_event_uuid.map(|uuid| uuid.to_string()),
+                event.payload_json.clone(),
+                event.payload_hash.clone(),
+                event.capability_id.clone(),
+                event.delegated_by.clone(),
+                event.expires_at.map(Monitor::timestamp_to_i64),
+                event.context_json.clone(),
+                event.signature.clone(),
+            ],
+        )
+        .await?;
+
+        let row_id = conn.last_insert_rowid();
+        Ok(row_id)
+    }
+
+    async fn get_audit_event(&self, event_uuid: Uuid) -> Result<Option<AuditEvent>> {
+        let conn = self.get_conn().await?;
+        let mut rows = conn
+            .query(
+                "SELECT
+                    id,
+                    event_uuid,
+                    event_type,
+                    schema_version,
+                    created_at,
+                    actor_id,
+                    actor_public_key,
+                    resource_type,
+                    resource_id,
+                    parent_event_uuid,
+                    payload_json,
+                    payload_hash,
+                    capability_id,
+                    delegated_by,
+                    expires_at,
+                    context_json,
+                    signature
+                 FROM audit_events
+                 WHERE event_uuid = ?",
+                params![event_uuid.to_string()],
+            )
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            Ok(Some(Self::map_audit_event_row(&row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_audit_events(&self, limit: usize) -> Result<Vec<AuditEvent>> {
+        let conn = self.get_conn().await?;
+        let mut rows = conn
+            .query(
+                "SELECT
+                    id,
+                    event_uuid,
+                    event_type,
+                    schema_version,
+                    created_at,
+                    actor_id,
+                    actor_public_key,
+                    resource_type,
+                    resource_id,
+                    parent_event_uuid,
+                    payload_json,
+                    payload_hash,
+                    capability_id,
+                    delegated_by,
+                    expires_at,
+                    context_json,
+                    signature
+                 FROM audit_events
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT ?",
+                params![limit as i64],
+            )
+            .await?;
+
+        let mut events = Vec::new();
+        while let Some(row) = rows.next().await? {
+            events.push(Self::map_audit_event_row(&row)?);
+        }
+
+        Ok(events)
     }
 }

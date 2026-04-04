@@ -16,6 +16,11 @@ pub struct MonitorConfig {
     pub check_type: CheckType,
     pub interval_seconds: u64,
     pub enabled: bool,
+    /// How many seconds to wait before the first check.
+    /// Used to stagger checks across peers so they don't all hit the
+    /// target at the same instant.  0 = start after one full interval
+    /// (original behaviour).
+    pub phase_offset_secs: u64,
 }
 
 /// Monitoring scheduler - coordinates execution of monitoring tasks
@@ -40,8 +45,22 @@ impl MonitoringScheduler {
                 return;
             }
 
-            let duration = Duration::from_secs(config.interval_seconds);
-            let mut timer = interval_at(Instant::now() + duration, duration);
+            let period = Duration::from_secs(config.interval_seconds);
+
+            // When a phase offset is specified, start the first tick at
+            // `now + phase_offset` and then tick every `interval`.  This
+            // staggers checks across peers so at most one peer hits the
+            // target at any given second.
+            // With no offset (or offset ≥ interval) fall back to the
+            // original "first check after one full interval" behaviour.
+            let first_tick = if config.phase_offset_secs > 0
+                && config.phase_offset_secs < config.interval_seconds
+            {
+                Instant::now() + Duration::from_secs(config.phase_offset_secs)
+            } else {
+                Instant::now() + period
+            };
+            let mut timer = interval_at(first_tick, period);
 
             loop {
                 timer.tick().await;
@@ -57,14 +76,6 @@ impl MonitoringScheduler {
                 }
             }
         })
-    }
-
-    /// Schedule multiple monitors
-    pub fn schedule_monitors(
-        &self,
-        configs: Vec<MonitorConfig>,
-    ) -> Vec<tokio::task::JoinHandle<()>> {
-        configs.into_iter().map(|config| self.schedule_monitor(config)).collect()
     }
 }
 
@@ -86,6 +97,7 @@ mod tests {
             check_type: CheckType::Https,
             interval_seconds: 1,
             enabled: true,
+            phase_offset_secs: 0,
         };
 
         let _handle = scheduler.schedule_monitor(config);
