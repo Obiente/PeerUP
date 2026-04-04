@@ -97,6 +97,7 @@ export async function createStatusPage(data: {
   monitorIds: string[];
   companyName?: string;
   customDomain?: string;
+  logoUrl?: string;
 }): Promise<{ success: boolean; page?: StatusPage; error?: string }> {
   try {
     const created = await statusPageClient.createStatusPage(new CreateStatusPageRequest({
@@ -104,6 +105,7 @@ export async function createStatusPage(data: {
       slug: data.slug,
       description: data.description ?? '',
       monitorIds: data.monitorIds,
+      logoUrl: data.logoUrl ?? '',
     }));
 
     return {
@@ -168,15 +170,15 @@ export async function updateStatusPage(
   data: Partial<StatusPage>
 ): Promise<{ success: boolean; page?: StatusPage; error?: string }> {
   try {
-    const updated = await statusPageClient.updateStatusPage(new UpdateStatusPageRequest({
-      id,
-      title: data.name,
-      slug: data.slug,
-      description: data.description,
-      monitorIds: data.monitorIds ?? [],
-      isActive: data.isPublished,
-      logoUrl: data.companyLogo,
-    }));
+    const request: any = { id };
+    if (data.name !== undefined) request.title = data.name;
+    if (data.slug !== undefined) request.slug = data.slug;
+    if (data.description !== undefined) request.description = data.description;
+    if (data.monitorIds !== undefined) request.monitorIds = data.monitorIds;
+    if (data.isPublished !== undefined) request.isActive = data.isPublished;
+    if (data.companyLogo !== undefined) request.logoUrl = data.companyLogo;
+
+    const updated = await statusPageClient.updateStatusPage(new UpdateStatusPageRequest(request));
 
     return {
       success: true,
@@ -244,7 +246,7 @@ export async function getMonitorUptime(
   };
 }
 
-export async function validateSlug(slug: string): Promise<{
+export async function validateSlug(slug: string, currentSlug?: string): Promise<{
   valid: boolean;
   message?: string;
 }> {
@@ -264,9 +266,12 @@ export async function validateSlug(slug: string): Promise<{
   }
 
   try {
-    await statusPageClient.getStatusPage(new GetStatusPageRequest({
+    const existing = await statusPageClient.getStatusPage(new GetStatusPageRequest({
       identifier: { case: 'slug', value: slug },
     }));
+    if (currentSlug && existing.slug === currentSlug) {
+      return { valid: true };
+    }
     return {
       valid: false,
       message: 'Slug is already in use',

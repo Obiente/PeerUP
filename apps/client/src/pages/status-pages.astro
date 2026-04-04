@@ -60,9 +60,15 @@ const avgUptime = statusPages.length > 0
 						<Heading level={1}>Public Status Pages</Heading>
 						<Paragraph color="secondary">Create and manage public status pages for your services</Paragraph>
 					</Stack>
-					<Button variant="primary" disabled={true}>
-						Create New Page Soon
+          {monitors.length > 0 ? (
+					<Button variant="primary" href="/status-pages-new">
+						Create New Page
 					</Button>
+          ) : (
+					<Button variant="primary" disabled={true}>
+						Create New Page
+					</Button>
+          )}
 				</Flex>
 			</Section>
 
@@ -163,9 +169,15 @@ const avgUptime = statusPages.length > 0
 											<span class="px-2 py-1 bg-bg-tertiary rounded text-sm">+{monitors.length - 5} more</span>
 										)}
 									</div>
-									<Button variant="primary" size="lg" class="mt-4" disabled={true}>
-										Create Status Page Soon
+                  {monitors.length > 0 ? (
+									<Button variant="primary" size="lg" class="mt-4" href="/status-pages-new">
+										Create Status Page
 									</Button>
+                  ) : (
+									<Button variant="primary" size="lg" class="mt-4" disabled={true}>
+										Create Status Page
+									</Button>
+                  )}
 								</Stack>
 							) : (
 								<Stack gap="2" align="center">

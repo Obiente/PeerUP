@@ -1,0 +1,67 @@
+---
+import Layout from '../../../layouts/Layout.astro';
+import Header from '../../../components/Header.astro';
+import StatusPageForm from '../../../components/StatusPageForm.astro';
+import { monitorClient, statusPageClient } from '../../../lib/api/client';
+import { GetStatusPageRequest } from '../../../gen/statuspage/v1/statuspage_pb';
+
+const { slug } = Astro.params;
+if (!slug) return Astro.redirect('/status-pages');
+
+let monitors: any[] = [];
+let statusPage: any = null;
+let fetchError = false;
+
+try {
+  const [monitorResponse, pageResponse] = await Promise.all([
+    monitorClient.listMonitors({ page: 1, pageSize: 100, filter: '' }),
+    statusPageClient.getStatusPage(new GetStatusPageRequest({
+      identifier: { case: 'slug', value: slug },
+    })),
+  ]);
+
+  monitors = monitorResponse.monitors || [];
+  statusPage = pageResponse;
+} catch {
+  fetchError = true;
+}
+---
+
+<Layout title={`Edit ${statusPage?.title ?? 'Status Page'} - Uppe.`}>
+  <Header />
+
+  <main class="min-h-screen bg-bg-primary">
+    <div class="max-w-3xl mx-auto px-6 py-6">
+      {fetchError || !statusPage ? (
+        <div class="rounded-xl border border-primary bg-bg-secondary p-12 text-center space-y-4">
+          <p class="text-primary font-semibold text-lg">Status page not found</p>
+          <a href="/status-pages" class="inline-block text-sm mt-2" style="color: #c4a7e7;">← Back to Status Pages</a>
+        </div>
+      ) : (
+        <div class="space-y-5">
+          <div class="flex items-center justify-between">
+            <div>
+              <h1 class="text-xl font-semibold text-primary">Edit Status Page</h1>
+              <p class="text-secondary text-sm mt-0.5">Update branding, monitors, and publication state.</p>
+            </div>
+            <a href="/status-pages" class="text-secondary text-sm hover:text-accent-primary transition-colors">← Cancel</a>
+          </div>
+
+          <StatusPageForm
+            mode="edit"
+            monitors={monitors.map((monitor: any) => ({ id: monitor.id, name: monitor.name, url: monitor.url }))}
+            page={{
+              id: statusPage.id,
+              title: statusPage.title,
+              slug: statusPage.slug,
+              description: statusPage.description,
+              logoUrl: statusPage.logoUrl,
+              isActive: statusPage.isActive,
+              monitorIds: statusPage.monitorIds,
+            }}
+          />
+        </div>
+      )}
+    </div>
+  </main>
+</Layout>
