@@ -1,6 +1,7 @@
 ---
 import Header from "$components/Header.astro";
 import Layout from "$layouts/Layout.astro";
+import { networkClient } from "../lib/api/client";
 import { 
   Section, 
   Grid, 
@@ -12,8 +13,55 @@ import {
   MapLegend,
   WorldMap,
   PeerListItem,
-  HealthMetric
+  HealthMetric,
+  Alert,
+  Icon,
+  Flex,
+  Stack
 } from "$ui";
+import {
+  GetNetworkHealthRequest,
+  GetNetworkStatsRequest,
+  GetPeerDistributionRequest,
+  ListPeersRequest,
+  PeerStatus,
+} from "../gen/network/v1/network_pb";
+
+const [networkStats, peerResponse, networkHealth, peerDistribution] = await Promise.all([
+  networkClient.getNetworkStats(new GetNetworkStatsRequest({})),
+  networkClient.listPeers(new ListPeersRequest({ page: 1, pageSize: 8, sortBy: 'contribution' })),
+  networkClient.getNetworkHealth(new GetNetworkHealthRequest({})),
+  networkClient.getPeerDistribution(new GetPeerDistributionRequest({})),
+]);
+
+const myNodeId = networkStats.myNodeId || 'node-unannounced';
+const totalPeers = Number(networkStats.totalPeers);
+const onlinePeers = Number(networkStats.onlinePeers);
+const checksPerHour = Number(networkStats.checksPerHour);
+const checksPerformedToday = Number(networkStats.checksPerformedToday);
+const checksReceivedToday = Number(networkStats.checksReceivedToday);
+const bandwidthUsedMb = Number(networkStats.bandwidthUsedMb);
+const bandwidthLimitMb = Number(networkStats.bandwidthLimitMb);
+const shareRatio = networkStats.shareRatio;
+const coveragePercentage = networkStats.coveragePercentage;
+
+const formatLocation = (peer: { location?: { city?: string; region?: string; country?: string } }) => {
+  const parts = [peer.location?.city, peer.location?.region, peer.location?.country].filter(Boolean);
+  return parts.length > 0 ? parts.join(', ') : 'Unknown region';
+};
+
+const toUiStatus = (status: PeerStatus): 'online' | 'warning' | 'offline' | 'error' => {
+  switch (status) {
+    case PeerStatus.ONLINE:
+      return 'online';
+    case PeerStatus.SLOW:
+      return 'warning';
+    case PeerStatus.OFFLINE:
+      return 'offline';
+    default:
+      return 'error';
+  }
+};
 
 const legendItems = [
   { status: 'online' as const, label: 'Online' },
@@ -21,20 +69,24 @@ const legendItems = [
   { status: 'error' as const, label: 'Offline' }
 ];
 
-const topPeers = [
-  { peerId: 'peer_a1b2c3d4', location: 'Tokyo, Japan', checksPerDay: 12450, status: 'online' as const },
-  { peerId: 'peer_e5f6g7h8', location: 'New York, USA', checksPerDay: 11230, status: 'online' as const },
-  { peerId: 'peer_i9j0k1l2', location: 'London, UK', checksPerDay: 10890, status: 'online' as const },
-  { peerId: 'peer_m3n4o5p6', location: 'Sydney, Australia', checksPerDay: 9450, status: 'online' as const },
-  { peerId: 'peer_q7r8s9t0', location: 'São Paulo, Brazil', checksPerDay: 8760, status: 'warning' as const }
-];
+const topPeers = peerResponse.peers.map((peer) => ({
+  peerId: peer.peerId,
+  location: formatLocation(peer),
+  checksPerDay: Number(peer.checksPerDay),
+  status: toUiStatus(peer.status),
+}));
 
 const healthMetrics = [
-  { label: 'Consensus Rate', value: 96, unit: '%', variant: 'success' as const },
-  { label: 'Avg Latency', value: 78, unit: 'ms', variant: 'warning' as const },
-  { label: 'Redundancy', value: 8.5, unit: 'x', variant: 'primary' as const },
-  { label: 'Churn Rate', value: 1.2, unit: '%', variant: 'success' as const }
+  { label: 'Consensus', value: Math.round(networkHealth.consensusRate), unit: '%', variant: 'success' as const },
+  { label: 'Redundancy', value: Math.round(networkHealth.redundancyFactor * 10) / 10, unit: 'x', variant: 'primary' as const },
+  { label: 'Churn (24h)', value: Math.round(networkHealth.churnRate * 10) / 10, unit: '%', variant: 'warning' as const },
+  { label: 'Bandwidth', value: bandwidthLimitMb > 0 ? Math.round((bandwidthUsedMb / bandwidthLimitMb) * 100) : 0, unit: '%', variant: 'primary' as const }
 ];
+
+const regionSummary = peerDistribution.regions.slice(0, 4).map((region) => ({
+  label: region.region,
+  value: `${region.onlineCount}/${region.peerCount} online`,
+}));
 ---
 
 <Layout title="Network Map - Uppe." description="Visualize the P2P monitoring network">
@@ -46,29 +98,44 @@ const healthMetrics = [
       <Paragraph class="text-secondary">Real-time visualization of the Uppe. monitoring network</Paragraph>
     </Section>
 
+    <!-- Live Network Banner -->
+    <Section>
+      <Alert variant="info">
+        <strong>Live network data.</strong> This page now reads from the shared network tables exposed by
+        the Go API. Some advanced metrics are still coarse until peer verification and audit pipelines land.
+      </Alert>
+    </Section>
+
     <!-- Network Stats -->
     <Section>
       <Grid cols="4">
         <MetricCard 
           title="Total Peers" 
-          value="1,823"
+          value={String(totalPeers)}
           icon="NETWORK"
+          change={`${onlinePeers} online`}
+          changeType={onlinePeers > 0 ? "positive" : "neutral"}
         />
         <MetricCard 
-          title="Online Peers" 
-          value="1,647"
+          title="Node ID" 
+          value={myNodeId.slice(0, 12)}
           icon="ANALYTICS"
-          changeType="positive"
+          change={totalPeers > 1 ? "Connected to live peer set" : "Single-node or sparse network"}
+          changeType="neutral"
         />
         <MetricCard 
           title="Checks/Hour" 
-          value="2.4M"
+          value={String(checksPerHour)}
           icon="PERFORMANCE"
+          change={`${checksPerformedToday} local / ${checksReceivedToday} remote today`}
+          changeType={checksPerHour > 0 ? "positive" : "neutral"}
         />
         <MetricCard 
           title="Coverage" 
-          value="98.7%"
+          value={`${Math.round(coveragePercentage)}%`}
           icon="GLOBAL"
+          change={`${peerDistribution.regions.length} regions discovered`}
+          changeType={coveragePercentage >= 50 ? "positive" : "warning"}
         />
       </Grid>
     </Section>
@@ -81,8 +148,12 @@ const healthMetrics = [
             <Heading level={2}>Global Network</Heading>
             <MapLegend items={legendItems} />
           </div>
-
+          
           <WorldMap />
+          
+          <Paragraph class="text-secondary text-center mt-4">
+            Geographic rendering is still generic, but the peer and region counts below now come from the live P2P tables.
+          </Paragraph>
         </CardBody>
       </Card>
     </Section>
@@ -90,19 +161,21 @@ const healthMetrics = [
     <!-- Peer Details -->
     <Section>
       <Grid cols="2">
-        <!-- Top Contributors -->
+        <!-- This Node -->
         <Card>
           <CardBody>
-            <Heading level={3} class="mb-4">Top Contributors</Heading>
+            <Heading level={3} class="mb-4">Your Node</Heading>
             <div class="space-y-4">
-              {topPeers.map(peer => (
-                <PeerListItem 
-                  peerId={peer.peerId}
-                  location={peer.location}
-                  checksPerDay={peer.checksPerDay}
-                  status={peer.status}
-                />
-              ))}
+              <PeerListItem 
+                peerId={myNodeId}
+                location={regionSummary[0]?.label || 'Local installation'}
+                checksPerDay={checksPerformedToday}
+                status="online"
+              />
+              <Paragraph class="text-secondary text-sm">
+                Your node is identified from the shared results database. The live contribution ratio is
+                {` ${shareRatio.toFixed(2)} `}and current network score is {networkStats.contributionScore.toFixed(2)}.
+              </Paragraph>
             </div>
           </CardBody>
         </Card>
@@ -121,9 +194,60 @@ const healthMetrics = [
                 />
               ))}
             </div>
+            <Paragraph class="text-secondary text-sm mt-4">
+              Average observed latency: {Math.round(networkHealth.avgLatencyMs)}ms
+            </Paragraph>
           </CardBody>
         </Card>
       </Grid>
+    </Section>
+
+    <!-- Peer and Region Overview -->
+    <Section>
+      <Card>
+        <CardBody>
+          <Heading level={3} class="mb-4">Top Peers</Heading>
+          <Stack gap="3" class="mb-6">
+            {topPeers.length > 0 ? topPeers.map((peer) => (
+              <PeerListItem 
+                peerId={peer.peerId}
+                location={peer.location}
+                checksPerDay={peer.checksPerDay}
+                status={peer.status}
+              />
+            )) : (
+              <Paragraph class="text-secondary text-sm">
+                No replicated peers have been recorded yet.
+              </Paragraph>
+            )}
+          </Stack>
+
+          <Heading level={3} class="mb-4">Region Summary</Heading>
+          <Grid cols="3" gap="4">
+            {regionSummary.length > 0 ? regionSummary.map((region) => (
+              <div class="p-4 bg-bg-tertiary rounded-lg">
+                <Flex align="center" gap="2" class="mb-2">
+                  <Icon icon="GLOBAL" class="size-5 text-accent-primary" />
+                  <Heading level={4}>{region.label}</Heading>
+                </Flex>
+                <Paragraph class="text-secondary text-sm">
+                  {region.value}
+                </Paragraph>
+              </div>
+            )) : (
+              <div class="p-4 bg-bg-tertiary rounded-lg">
+                <Flex align="center" gap="2" class="mb-2">
+                  <Icon icon="GLOBAL" class="size-5 text-accent-primary" />
+                  <Heading level={4}>No regions yet</Heading>
+                </Flex>
+                <Paragraph class="text-secondary text-sm">
+                  Peer geography will appear here once nodes publish replicated location metadata.
+                </Paragraph>
+              </div>
+            )}
+          </Grid>
+        </CardBody>
+      </Card>
     </Section>
   </main>
 </Layout>
