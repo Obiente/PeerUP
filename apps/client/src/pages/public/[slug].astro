@@ -3,6 +3,15 @@ import Layout from '../../layouts/Layout.astro';
 import UptimeChart from '../../components/UptimeChart.astro';
 import GlobalPingMap from '../../components/GlobalPingMap.astro';
 import IncidentList from '../../components/IncidentList.astro';
+import { monitorClient, resultClient, statusPageClient } from '../../lib/api/client';
+import {
+  AggregationPeriod,
+  GetAggregatedStatsRequest,
+  GetGlobalPingRequest,
+  GetResultsRequest,
+  ResultStatus,
+} from '../../gen/result/v1/result_pb';
+import { GetStatusPageRequest, RecordVisitRequest } from '../../gen/statuspage/v1/statuspage_pb';
 import { 
   Section, 
   Grid, 
@@ -15,80 +24,220 @@ import {
   Badge
 } from "../../components/ui";
 
-export async function getStaticPaths() {
-  // In a real app, this would fetch from your API or database
-  return [
-    { params: { slug: 'production-api' } },
-    { params: { slug: 'website' } },
-    { params: { slug: 'database' } }
-  ];
+const { slug } = Astro.params;
+if (!slug) {
+  return Astro.redirect('/status-pages');
 }
 
-const { slug } = Astro.params;
+const now = Math.floor(Date.now() / 1000);
+const dayAgo = now - 24 * 60 * 60;
 
-// Mock public status page data - in real app, this would come from API
-const statusPage = {
-	slug: slug,
-	title: 'Production API Status',
-	description: 'Real-time status and uptime monitoring for our production API service',
-	url: 'https://api.example.com',
-	status: 'online',
-	uptime: 99.97,
-	avgResponseTime: 142,
-	lastCheck: '2024-01-15T10:30:00Z',
-	monitoringPeers: 12,
-	owner: 'Example Corp',
-	logo: '/logo.png',
-	customBranding: {
-		primaryColor: '#eb6f92',
-		backgroundColor: '#191724',
-		textColor: '#e0def4'
-	}
+let statusPage: any = null;
+let notFound = false;
+
+try {
+  statusPage = await statusPageClient.getStatusPage(new GetStatusPageRequest({
+    identifier: { case: 'slug', value: slug },
+  }));
+  await statusPageClient.recordVisit(new RecordVisitRequest({ statusPageId: statusPage.id }));
+} catch {
+  notFound = true;
+  Astro.response.status = 404;
+}
+
+const formatLocation = (location: any, fallback: string) => {
+  const parts = [location?.city, location?.region, location?.country].filter(Boolean);
+  return parts.length > 0 ? parts.join(', ') : fallback;
 };
 
-const uptimeData = [99.5, 99.8, 99.2, 99.9, 99.6, 99.7, 99.9, 99.8, 99.5, 99.3, 99.7, 99.8, 99.9, 99.6, 99.4, 99.7, 99.8, 99.9, 99.5, 99.6, 99.8, 99.7, 99.9, 99.8];
+const statusFromResult = (result: any) => {
+  switch (result?.status) {
+    case ResultStatus.UP:
+      return 'online';
+    case ResultStatus.DEGRADED:
+      return 'degraded';
+    case ResultStatus.DOWN:
+    case ResultStatus.TIMEOUT:
+    case ResultStatus.ERROR:
+      return 'offline';
+    default:
+      return 'unknown';
+  }
+};
+
+const globalPingStatus = (status: ResultStatus) => {
+  switch (status) {
+    case ResultStatus.UP:
+      return 'online' as const;
+    case ResultStatus.TIMEOUT:
+      return 'timeout' as const;
+    default:
+      return 'error' as const;
+  }
+};
+
+let monitorSummaries: any[] = [];
+let uptimeData: number[] = Array.from({ length: 24 }, () => Number(statusPage?.uptime ?? 100));
+let peerData: any[] = [];
+let recentIncidents: any[] = [];
+let overallStatus: 'online' | 'offline' | 'degraded' | 'maintenance' | 'unknown' = 'unknown';
+let avgResponseTime = 0;
+let monitoringPeers = 0;
+let primaryMetric = 'No monitors linked';
+let lastUpdatedAt = new Date(Number(statusPage?.updatedAt ?? now) * 1000).toISOString();
+
+if (!notFound && statusPage) {
+  const monitorDataResults = await Promise.allSettled(
+    statusPage.monitorIds.map(async (monitorId: string) => {
+      const [monitor, latestResults, stats, globalPing] = await Promise.all([
+        monitorClient.getMonitor({ id: monitorId }),
+        resultClient.getResults(new GetResultsRequest({
+          monitorId,
+          startTime: dayAgo,
+          endTime: now,
+          limit: 1,
+          offset: 0,
+        })),
+        resultClient.getAggregatedStats(new GetAggregatedStatsRequest({
+          monitorId,
+          startTime: dayAgo,
+          endTime: now,
+          period: AggregationPeriod.HOUR,
+        })),
+        resultClient.getGlobalPing(new GetGlobalPingRequest({
+          monitorId,
+          startTime: dayAgo,
+          endTime: now,
+        })),
+      ]);
+
+      return {
+        monitor,
+        latestResult: latestResults.results[0],
+        stats: stats.dataPoints,
+        globalPing: globalPing.samples,
+      };
+    })
+  );
+
+  const monitorData = monitorDataResults
+    .filter((result) => result.status === 'fulfilled')
+    .map((result: any) => result.value);
+
+  monitorSummaries = monitorData.map((entry) => ({
+    id: entry.monitor.id,
+    name: entry.monitor.publicDisplayName || entry.monitor.name,
+    url: entry.monitor.url,
+    status: statusFromResult(entry.latestResult),
+    latestResult: entry.latestResult,
+  }));
+
+  const latestTimestamps = monitorData
+    .map((entry) => Number(entry.latestResult?.timestamp ?? 0))
+    .filter((value) => value > 0);
+  if (latestTimestamps.length > 0) {
+    lastUpdatedAt = new Date(Math.max(...latestTimestamps) * 1000).toISOString();
+  }
+
+  const latestLatencies = monitorData
+    .map((entry) => Number(entry.latestResult?.latencyMs ?? 0))
+    .filter((value) => value > 0);
+  avgResponseTime = latestLatencies.length > 0
+    ? Math.round(latestLatencies.reduce((sum, value) => sum + value, 0) / latestLatencies.length)
+    : 0;
+
+  const statusValues = monitorSummaries.map((entry) => entry.status);
+  if (statusValues.length === 0) {
+    overallStatus = 'unknown';
+  } else if (statusValues.some((status) => status === 'offline')) {
+    overallStatus = 'offline';
+  } else if (statusValues.some((status) => status === 'degraded')) {
+    overallStatus = 'degraded';
+  } else if (statusValues.every((status) => status === 'online')) {
+    overallStatus = 'online';
+  }
+
+  const hourlyBuckets = new Map<number, number[]>();
+  for (const entry of monitorData) {
+    for (const point of entry.stats) {
+      const timestamp = Number(point.timestamp ?? 0);
+      const bucket = Math.floor((now - timestamp) / 3600);
+      if (bucket < 0 || bucket >= 24) continue;
+      const values = hourlyBuckets.get(bucket) ?? [];
+      values.push(Number(point.uptimePercentage ?? 0));
+      hourlyBuckets.set(bucket, values);
+    }
+  }
+
+  uptimeData = Array.from({ length: 24 }, (_, index) => {
+    const bucket = 23 - index;
+    const values = hourlyBuckets.get(bucket);
+    if (!values || values.length === 0) return Number(statusPage.uptime ?? 100);
+    return Math.round(values.reduce((sum, value) => sum + value, 0) / values.length);
+  });
+
+  const pingSamples = monitorData.flatMap((entry) => entry.globalPing);
+  const latestByPeer = new Map<string, any>();
+  for (const sample of pingSamples) {
+    const existing = latestByPeer.get(sample.peerId);
+    if (!existing || Number(sample.timestamp ?? 0) > Number(existing.timestamp ?? 0)) {
+      latestByPeer.set(sample.peerId, sample);
+    }
+  }
+
+  peerData = Array.from(latestByPeer.values()).map((sample) => ({
+    id: sample.peerId,
+    location: formatLocation(sample.location, sample.peerId.slice(0, 8)),
+    latitude: 0,
+    longitude: 0,
+    ping: Number(sample.latencyMs ?? 0),
+    status: globalPingStatus(sample.status),
+    lastCheck: new Date(Number(sample.timestamp ?? 0) * 1000).toLocaleString(),
+  }));
+  monitoringPeers = peerData.length;
+
+  primaryMetric = monitorSummaries.length === 1
+    ? monitorSummaries[0].url
+    : `${monitorSummaries.length} services`;
+
+  if (Number(statusPage.lastIncident ?? 0) > 0) {
+    const incidentTime = new Date(Number(statusPage.lastIncident) * 1000);
+    recentIncidents = [{
+      id: `incident-${statusPage.id}`,
+      title: 'Recent incident detected',
+      description: 'A recent incident timestamp exists for this status page. Detailed incident timelines are not exposed yet.',
+      status: 'resolved' as const,
+      time: incidentTime.toLocaleString(),
+      duration: 'Unavailable',
+    }];
+  }
+}
+
+const pageTitle = `${statusPage?.title ?? 'Status Page'} - Status Page`;
+const metaDescription = `${statusPage?.description ?? 'Status page'} - Current uptime: ${Number(statusPage?.uptime ?? 100).toFixed(2)}%`;
 const hours = Array.from({ length: 24 }, (_, i) => i);
-
-const peerData = [
-	{ id: '1', location: 'New York, US', latitude: 40.7128, longitude: -74.0060, ping: 45, status: 'online' as const, lastCheck: '2024-01-15T10:30:00Z' },
-	{ id: '2', location: 'London, UK', latitude: 51.5074, longitude: -0.1278, ping: 78, status: 'online' as const, lastCheck: '2024-01-15T10:30:00Z' },
-	{ id: '3', location: 'Tokyo, JP', latitude: 35.6762, longitude: 139.6503, ping: 125, status: 'online' as const, lastCheck: '2024-01-15T10:30:00Z' },
-	{ id: '4', location: 'Sydney, AU', latitude: -33.8688, longitude: 151.2093, ping: 189, status: 'timeout' as const, lastCheck: '2024-01-15T10:29:00Z' },
-	{ id: '5', location: 'São Paulo, BR', latitude: -23.5505, longitude: -46.6333, ping: 156, status: 'online' as const, lastCheck: '2024-01-15T10:30:00Z' }
-];
-
-const recentIncidents = [
-	{
-		id: '1',
-		title: 'API Response Timeout',
-		description: 'Increased response times detected from multiple monitoring peers',
-		status: 'resolved' as const,
-		time: '2024-01-12T14:23:00Z',
-		duration: '24 minutes'
-	},
-	{
-		id: '2',
-		title: 'Service Unreachable',
-		description: 'Service completely unreachable from European peers',
-		status: 'resolved' as const,
-		time: '2024-01-10T08:15:00Z',
-		duration: '8 minutes'
-	}
-];
-
-const pageTitle = `${statusPage.title} - Status Page`;
-const metaDescription = `${statusPage.description} - Current uptime: ${statusPage.uptime}%`;
 ---
 
 <Layout title={pageTitle}>
-	<div class="min-h-screen bg-surface-primary text-primary">
+	<div class="min-h-screen bg-surface-primary text-primary" style={`--brand-primary: ${statusPage?.primaryColor ?? '#c4a7e7'}`}>
+    {notFound || !statusPage ? (
+      <main class="max-w-4xl mx-auto px-6 py-16">
+        <Card>
+          <CardBody>
+            <Heading level={2} class="mb-3">Status page not found</Heading>
+            <Paragraph class="text-secondary">No published status page exists for <code class="font-mono">{slug}</code>.</Paragraph>
+          </CardBody>
+        </Card>
+      </main>
+    ) : (
+    <>
 		<!-- Header -->
 		<header class="border-b border-primary bg-surface-primary">
 			<div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
 				<div class="flex items-center justify-between">
 					<div class="flex items-center gap-4">
-						{statusPage.logo && (
-							<img src={statusPage.logo} alt={statusPage.owner} class="w-8 h-8 rounded" />
+						{statusPage.logoUrl && (
+							<img src={statusPage.logoUrl} alt={statusPage.title} class="w-8 h-8 rounded" />
 						)}
 						<div>
 							<Heading level={1} class="text-2xl font-bold text-primary">{statusPage.title}</Heading>
@@ -96,7 +245,7 @@ const metaDescription = `${statusPage.description} - Current uptime: ${statusPag
 						</div>
 					</div>
 					<div class="flex items-center gap-3">
-						<StatusBadge status={statusPage.status as 'online' | 'offline' | 'degraded' | 'maintenance' | 'unknown'} />
+						<StatusBadge status={overallStatus} />
 					</div>
 				</div>
 			</div>
@@ -105,22 +254,24 @@ const metaDescription = `${statusPage.description} - Current uptime: ${statusPag
 		<main class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
 			<!-- Current Status Banner -->
 			<Section>
-				<Card class={`border-2 ${statusPage.status === 'online' ? 'bg-status-online/10 border-status-online' : 'bg-status-error/10 border-status-error'}`}>
+				<Card class={`border-2 ${overallStatus === 'online' ? 'bg-status-online/10 border-status-online' : overallStatus === 'degraded' ? 'bg-status-warning/10 border-status-warning' : 'bg-status-error/10 border-status-error'}`}>
 					<CardBody>
 						<div class="flex items-center justify-between">
 							<div>
 								<Heading level={2} class="text-xl font-semibold text-primary mb-2">
-									{statusPage.status === 'online' ? 'All Systems Operational' : 'Service Disruption'}
+									{overallStatus === 'online' ? 'All Systems Operational' : overallStatus === 'degraded' ? 'Performance Degradation' : 'Service Disruption'}
 								</Heading>
 								<Paragraph class="text-secondary">
-									{statusPage.status === 'online' 
-										? 'All monitored services are running smoothly' 
-										: 'We are experiencing issues with our services'
+									{overallStatus === 'online' 
+										? 'All monitored services are currently reporting healthy checks.' 
+										: overallStatus === 'degraded'
+                    ? 'At least one service is degraded but still responding.'
+                    : 'One or more monitored services are failing checks.'
 									}
 								</Paragraph>
 							</div>
 							<div class="text-right">
-								<div class="text-3xl font-bold text-primary">{statusPage.uptime}%</div>
+								<div class="text-3xl font-bold text-primary">{Number(statusPage.uptime).toFixed(2)}%</div>
 								<div class="text-sm text-secondary">24h uptime</div>
 							</div>
 						</div>
@@ -132,18 +283,18 @@ const metaDescription = `${statusPage.description} - Current uptime: ${statusPag
 			<Section>
 				<Grid cols="3">
 					<MetricCard 
-						title="Service URL" 
-						value={statusPage.url}
+						title="Service Scope" 
+						value={primaryMetric}
 						icon="GLOBAL"
 					/>
 					<MetricCard 
 						title="Response Time" 
-						value={`${statusPage.avgResponseTime}ms`}
+						value={avgResponseTime > 0 ? `${avgResponseTime}ms` : 'N/A'}
 						icon="PERFORMANCE"
 					/>
 					<MetricCard 
 						title="Monitoring Locations" 
-						value={statusPage.monitoringPeers.toString()}
+						value={monitoringPeers.toString()}
 						icon="PERFORMANCE"
 					/>
 				</Grid>
@@ -156,7 +307,7 @@ const metaDescription = `${statusPage.description} - Current uptime: ${statusPag
 
 			<!-- Global Monitoring Map -->
 			<Section>
-				<GlobalPingMap peerData={peerData} targetUrl={statusPage.url} />
+				<GlobalPingMap peerData={peerData} targetUrl={primaryMetric} />
 			</Section>
 
 			<!-- Recent Incidents -->
@@ -166,40 +317,39 @@ const metaDescription = `${statusPage.description} - Current uptime: ${statusPag
 
 			<!-- Footer -->
 			<Section>
+        <Grid cols="3">
+          {monitorSummaries.map((monitor) => (
+            <Card>
+              <CardBody>
+                <Heading level={3} class="mb-2">{monitor.name}</Heading>
+                <Paragraph class="text-secondary text-sm mb-3">{monitor.url}</Paragraph>
+                <Badge variant={monitor.status === 'online' ? 'success' : monitor.status === 'degraded' ? 'warning' : 'error'}>
+                  {monitor.status}
+                </Badge>
+              </CardBody>
+            </Card>
+          ))}
+        </Grid>
+      </Section>
+
+			<Section>
 				<footer class="border-t border-primary pt-8 mt-12">
 					<div class="text-center text-secondary">
 						<Paragraph class="mb-2">Powered by <strong class="text-primary">Uppe.</strong></Paragraph>
 						<Paragraph class="text-sm">Decentralized P2P uptime monitoring</Paragraph>
 						<div class="mt-4 flex items-center justify-center gap-4 text-xs">
-							<span>Last updated: {new Date(statusPage.lastCheck).toLocaleString()}</span>
+							<span>Last updated: {new Date(lastUpdatedAt).toLocaleString()}</span>
 							<span>•</span>
-							<span>Monitored by {statusPage.monitoringPeers} peers worldwide</span>
+							<span>Monitored by {monitoringPeers} peers worldwide</span>
 						</div>
 					</div>
 				</footer>
 			</Section>
 		</main>
+    </>
+    )}
 	</div>
 </Layout>
-
-<style>
-	/* Custom branding support */
-	:root {
-		--brand-primary: var(--color-accent-primary);
-		--brand-bg: var(--color-surface-primary);
-		--brand-text: var(--color-text-primary);
-	}
-	
-	/* Override theme colors if custom branding is provided */
-	.custom-brand {
-		background-color: var(--brand-bg);
-		color: var(--brand-text);
-	}
-	
-	.custom-brand .accent {
-		color: var(--brand-primary);
-	}
-</style>
 
 <script>
 	// Auto-refresh the page every 30 seconds
