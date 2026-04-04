@@ -289,3 +289,17 @@ pub struct AuditEvent {
     pub context_json: Option<String>,
     pub signature: Vec<u8>,
 }
+
+/// Peer attestation over a previously stored audit event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditAttestation {
+    pub id: Option<i64>,
+    pub attestation_uuid: Uuid,
+    pub subject_event_uuid: Uuid,
+    pub attestor_id: String,
+    pub attestor_public_key: Vec<u8>,
+    pub decision: String,
+    pub reason: Option<String>,
+    pub created_at: SystemTime,
+    pub signature: Vec<u8>,
+}

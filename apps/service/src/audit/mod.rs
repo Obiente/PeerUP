@@ -1,14 +1,18 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::crypto::KeyPair;
+use crate::crypto::{KeyPair, load_or_generate_keypair};
+use crate::database::Database;
+use crate::database::models::{AuditAttestation, AuditEvent, Monitor, PeerResult};
+use crate::monitoring::types::CheckResult;
 
 #[derive(Debug, Clone, Serialize)]
 struct SignableEventEnvelope<'a> {
@@ -27,6 +31,17 @@ struct SignableEventEnvelope<'a> {
     delegated_by: Option<&'a str>,
     expires_at: Option<i64>,
     context_json: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SignableAttestationEnvelope<'a> {
+    attestation_id: &'a str,
+    subject_event_id: &'a str,
+    attestor_id: &'a str,
+    attestor_public_key_hex: String,
+    decision: &'a str,
+    reason: Option<&'a str>,
+    created_at: i64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -61,6 +76,44 @@ pub struct NewSignedEvent<'a, T: Serialize, C: Serialize> {
     pub delegated_by: Option<&'a str>,
     pub expires_at: Option<SystemTime>,
     pub context: Option<&'a C>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditDecision {
+    Accepted,
+    Rejected,
+    Observed,
+}
+
+impl AuditDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Observed => "observed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SignedAuditAttestation {
+    pub attestation_id: Uuid,
+    pub subject_event_id: Uuid,
+    pub attestor_id: String,
+    pub attestor_public_key: Vec<u8>,
+    pub decision: AuditDecision,
+    pub reason: Option<String>,
+    pub created_at: SystemTime,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewAuditAttestation<'a> {
+    pub subject_event_id: Uuid,
+    pub attestor_id: &'a str,
+    pub decision: AuditDecision,
+    pub reason: Option<&'a str>,
 }
 
 impl SignedEventEnvelope {
@@ -158,8 +211,357 @@ impl SignedEventEnvelope {
     }
 }
 
+impl SignedAuditAttestation {
+    pub fn sign(spec: NewAuditAttestation<'_>, keypair: &KeyPair) -> Result<Self> {
+        let mut attestation = Self {
+            attestation_id: Uuid::new_v4(),
+            subject_event_id: spec.subject_event_id,
+            attestor_id: spec.attestor_id.to_string(),
+            attestor_public_key: keypair.public_key_bytes().to_vec(),
+            decision: spec.decision,
+            reason: spec.reason.map(ToOwned::to_owned),
+            created_at: SystemTime::now(),
+            signature: Vec::new(),
+        };
+
+        let signature = keypair.signing_key.sign(&attestation.signing_bytes()?);
+        attestation.signature = signature.to_bytes().to_vec();
+        Ok(attestation)
+    }
+
+    pub fn verify(&self) -> Result<bool> {
+        let public_key_bytes: [u8; 32] = self
+            .attestor_public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("invalid attestor public key length"))?;
+        let signature_bytes: [u8; 64] = self
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("invalid attestation signature length"))?;
+
+        let verifying_key = VerifyingKey::from_bytes(&public_key_bytes)
+            .map_err(|e| anyhow!("invalid attestor public key: {e}"))?;
+        let signature = Signature::from_bytes(&signature_bytes);
+        Ok(verifying_key.verify(&self.signing_bytes()?, &signature).is_ok())
+    }
+
+    pub fn to_model(&self) -> AuditAttestation {
+        AuditAttestation {
+            id: None,
+            attestation_uuid: self.attestation_id,
+            subject_event_uuid: self.subject_event_id,
+            attestor_id: self.attestor_id.clone(),
+            attestor_public_key: self.attestor_public_key.clone(),
+            decision: self.decision.as_str().to_string(),
+            reason: self.reason.clone(),
+            created_at: self.created_at,
+            signature: self.signature.clone(),
+        }
+    }
+
+    fn signing_bytes(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&SignableAttestationEnvelope {
+            attestation_id: &self.attestation_id.to_string(),
+            subject_event_id: &self.subject_event_id.to_string(),
+            attestor_id: &self.attestor_id,
+            attestor_public_key_hex: hex::encode(&self.attestor_public_key),
+            decision: self.decision.as_str(),
+            reason: self.reason.as_deref(),
+            created_at: system_time_to_i64(self.created_at),
+        })?)
+    }
+}
+
 pub fn canonical_json_string(value: &Value) -> Result<String> {
     Ok(serde_json::to_string(&canonicalize_value(value))?)
+}
+
+#[derive(Debug, Serialize)]
+struct MonitorAuditPayload<'a> {
+    action: &'a str,
+    monitor_uuid: Uuid,
+    name: &'a str,
+    target: &'a str,
+    check_type: &'a str,
+    interval_seconds: u64,
+    timeout_seconds: u64,
+    enabled: bool,
+    visibility: &'a crate::database::models::MonitorVisibility,
+    public_domain: Option<&'a str>,
+    public_display_name: Option<&'a str>,
+    owner_peer_id: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResultAuditPayload<'a> {
+    source: &'a str,
+    monitor_uuid: Uuid,
+    target: &'a str,
+    check_type: &'a str,
+    status: &'a crate::monitoring::types::MonitorStatus,
+    latency_ms: Option<u64>,
+    status_code: Option<u16>,
+    error_message: Option<&'a str>,
+    peer_id: &'a str,
+    timestamp: i64,
+    verified: Option<bool>,
+    source_peer_id: Option<&'a str>,
+    synced_from_peer: Option<bool>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize)]
+struct AdminTrustAuditPayload<'a> {
+    action: &'a str,
+    source: &'a str,
+    version: u64,
+    previous_version: Option<u64>,
+    key_count: usize,
+    rotation_count: usize,
+    revoked_key_count: usize,
+}
+
+pub fn load_local_keypair() -> Result<KeyPair> {
+    let keypair_path =
+        std::env::var("UPPE_KEYPAIR_PATH").unwrap_or_else(|_| "uppe_keypair.key".to_string());
+    let keypair_path = PathBuf::from(keypair_path);
+    load_or_generate_keypair(&keypair_path)
+        .with_context(|| format!("failed to load local audit keypair from {:?}", keypair_path))
+}
+
+pub async fn record_monitor_event(
+    database: &dyn Database,
+    keypair: &KeyPair,
+    actor_id: &str,
+    action: &str,
+    monitor: &Monitor,
+) -> Result<Uuid> {
+    let event_type = match action {
+        "created" => "monitor.created",
+        "updated" => "monitor.updated",
+        "deleted" => "monitor.deleted",
+        _ => "monitor.updated",
+    };
+    let resource_id = monitor.uuid.to_string();
+
+    let payload = MonitorAuditPayload {
+        action,
+        monitor_uuid: monitor.uuid,
+        name: &monitor.name,
+        target: &monitor.target,
+        check_type: &monitor.check_type,
+        interval_seconds: monitor.interval_seconds,
+        timeout_seconds: monitor.timeout_seconds,
+        enabled: monitor.enabled,
+        visibility: &monitor.visibility,
+        public_domain: monitor.public_domain.as_deref(),
+        public_display_name: monitor.public_display_name.as_deref(),
+        owner_peer_id: monitor.owner_peer_id.as_deref(),
+    };
+
+    save_signed_event(
+        database,
+        keypair,
+        NewSignedEvent::<_, Value> {
+            event_type,
+            actor_id,
+            resource_type: "monitor",
+            resource_id: &resource_id,
+            parent_event_id: None,
+            payload: &payload,
+            capability_id: None,
+            delegated_by: None,
+            expires_at: None,
+            context: None,
+        },
+    )
+    .await
+}
+
+pub async fn record_local_result_event(
+    database: &dyn Database,
+    keypair: &KeyPair,
+    actor_id: &str,
+    source: &str,
+    result: &CheckResult,
+) -> Result<Uuid> {
+    let resource_id = result.monitor_id.to_string();
+    let payload = ResultAuditPayload {
+        source,
+        monitor_uuid: result.monitor_id,
+        target: &result.target,
+        check_type: &result.check_type,
+        status: &result.status,
+        latency_ms: result.latency_ms,
+        status_code: result.status_code,
+        error_message: result.error_message.as_deref(),
+        peer_id: &result.peer_id,
+        timestamp: system_time_to_i64(result.timestamp),
+        verified: None,
+        source_peer_id: None,
+        synced_from_peer: None,
+    };
+
+    save_signed_event(
+        database,
+        keypair,
+        NewSignedEvent::<_, Value> {
+            event_type: "monitor.result_recorded",
+            actor_id,
+            resource_type: "monitor",
+            resource_id: &resource_id,
+            parent_event_id: None,
+            payload: &payload,
+            capability_id: None,
+            delegated_by: None,
+            expires_at: None,
+            context: None,
+        },
+    )
+    .await
+}
+
+pub async fn record_peer_result_event(
+    database: &dyn Database,
+    keypair: &KeyPair,
+    actor_id: &str,
+    source: &str,
+    result: &PeerResult,
+) -> Result<Uuid> {
+    let resource_id = result.monitor_uuid.to_string();
+    let payload = ResultAuditPayload {
+        source,
+        monitor_uuid: result.monitor_uuid,
+        target: "",
+        check_type: "",
+        status: &result.status,
+        latency_ms: result.latency_ms,
+        status_code: result.status_code,
+        error_message: result.error_message.as_deref(),
+        peer_id: &result.peer_id,
+        timestamp: system_time_to_i64(result.timestamp),
+        verified: Some(result.verified),
+        source_peer_id: result.source_peer_id.as_deref(),
+        synced_from_peer: Some(result.synced_from_peer),
+    };
+
+    save_signed_event(
+        database,
+        keypair,
+        NewSignedEvent::<_, Value> {
+            event_type: "peer.result_recorded",
+            actor_id,
+            resource_type: "monitor",
+            resource_id: &resource_id,
+            parent_event_id: None,
+            payload: &payload,
+            capability_id: None,
+            delegated_by: None,
+            expires_at: None,
+            context: None,
+        },
+    )
+    .await
+}
+
+pub async fn record_result_verification_attestation(
+    database: &dyn Database,
+    keypair: &KeyPair,
+    actor_id: &str,
+    subject_event_id: Uuid,
+    verified: bool,
+    reason: Option<&str>,
+) -> Result<Uuid> {
+    let attestation = SignedAuditAttestation::sign(
+        NewAuditAttestation {
+            subject_event_id,
+            attestor_id: actor_id,
+            decision: if verified { AuditDecision::Accepted } else { AuditDecision::Rejected },
+            reason,
+        },
+        keypair,
+    )?;
+    let attestation_id = attestation.attestation_id;
+    database.save_audit_attestation(&attestation.to_model()).await?;
+    Ok(attestation_id)
+}
+
+#[allow(dead_code)]
+pub async fn record_admin_trust_event(
+    database: &dyn Database,
+    keypair: &KeyPair,
+    actor_id: &str,
+    action: &str,
+    source: &str,
+    version: u64,
+    previous_version: Option<u64>,
+    key_count: usize,
+    rotation_count: usize,
+    revoked_key_count: usize,
+) -> Result<Uuid> {
+    let payload = AdminTrustAuditPayload {
+        action,
+        source,
+        version,
+        previous_version,
+        key_count,
+        rotation_count,
+        revoked_key_count,
+    };
+
+    save_signed_event(
+        database,
+        keypair,
+        NewSignedEvent::<_, Value> {
+            event_type: "admin_trust.chain_updated",
+            actor_id,
+            resource_type: "admin_trust_chain",
+            resource_id: "global",
+            parent_event_id: None,
+            payload: &payload,
+            capability_id: None,
+            delegated_by: None,
+            expires_at: None,
+            context: None,
+        },
+    )
+    .await
+}
+
+async fn save_signed_event<T: Serialize, C: Serialize>(
+    database: &dyn Database,
+    keypair: &KeyPair,
+    spec: NewSignedEvent<'_, T, C>,
+) -> Result<Uuid> {
+    let envelope = SignedEventEnvelope::sign(spec, keypair)?;
+    let event_uuid = envelope.event_id;
+    let event = envelope_to_model(envelope);
+    database.save_audit_event(&event).await?;
+    Ok(event_uuid)
+}
+
+fn envelope_to_model(envelope: SignedEventEnvelope) -> AuditEvent {
+    AuditEvent {
+        id: None,
+        event_uuid: envelope.event_id,
+        event_type: envelope.event_type,
+        schema_version: envelope.schema_version,
+        created_at: envelope.created_at,
+        actor_id: envelope.actor_id,
+        actor_public_key: envelope.actor_public_key,
+        resource_type: envelope.resource_type,
+        resource_id: envelope.resource_id,
+        parent_event_uuid: envelope.parent_event_id,
+        payload_json: envelope.payload_json,
+        payload_hash: envelope.payload_hash,
+        capability_id: envelope.capability_id,
+        delegated_by: envelope.delegated_by,
+        expires_at: envelope.expires_at,
+        context_json: envelope.context_json,
+        signature: envelope.signature,
+    }
 }
 
 fn canonicalize_value(value: &Value) -> Value {
@@ -223,5 +625,22 @@ mod tests {
         .unwrap();
 
         assert!(event.verify().unwrap());
+    }
+
+    #[test]
+    fn signed_attestation_round_trips_verification() {
+        let keypair = generate_keypair();
+        let attestation = SignedAuditAttestation::sign(
+            NewAuditAttestation {
+                subject_event_id: Uuid::new_v4(),
+                attestor_id: "peer-1",
+                decision: AuditDecision::Accepted,
+                reason: Some("signature valid"),
+            },
+            &keypair,
+        )
+        .unwrap();
+
+        assert!(attestation.verify().unwrap());
     }
 }

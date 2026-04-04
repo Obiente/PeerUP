@@ -5,7 +5,9 @@ use libsql::{Connection, params};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use super::models::{AuditEvent, Monitor, MonitorResult, NetworkStats, Peer, PeerResult};
+use super::models::{
+    AuditAttestation, AuditEvent, Monitor, MonitorResult, NetworkStats, Peer, PeerResult,
+};
 use crate::monitoring::types::CheckResult;
 use crate::pool::LibsqlPool;
 
@@ -116,6 +118,15 @@ pub trait Database: Send + Sync {
 
     /// List recent signed audit events.
     async fn list_audit_events(&self, limit: usize) -> Result<Vec<AuditEvent>>;
+
+    /// Persist a signed audit attestation.
+    async fn save_audit_attestation(&self, attestation: &AuditAttestation) -> Result<i64>;
+
+    /// List attestations associated with an audit event.
+    async fn list_audit_attestations(
+        &self,
+        subject_event_uuid: Uuid,
+    ) -> Result<Vec<AuditAttestation>>;
 }
 
 /// LibSQL database implementation
@@ -166,6 +177,24 @@ impl DatabaseImpl {
             expires_at: expires_at.map(Monitor::i64_to_timestamp),
             context_json: row.get(15)?,
             signature: row.get(16)?,
+        })
+    }
+
+    fn map_audit_attestation_row(row: &libsql::Row) -> Result<AuditAttestation> {
+        let attestation_uuid: String = row.get(1)?;
+        let subject_event_uuid: String = row.get(2)?;
+        let created_at: i64 = row.get(7)?;
+
+        Ok(AuditAttestation {
+            id: Some(row.get(0)?),
+            attestation_uuid: Uuid::parse_str(&attestation_uuid)?,
+            subject_event_uuid: Uuid::parse_str(&subject_event_uuid)?,
+            attestor_id: row.get(3)?,
+            attestor_public_key: row.get(4)?,
+            decision: row.get(5)?,
+            reason: row.get(6)?,
+            created_at: Monitor::i64_to_timestamp(created_at),
+            signature: row.get(8)?,
         })
     }
 }
@@ -1070,5 +1099,67 @@ impl Database for DatabaseImpl {
         }
 
         Ok(events)
+    }
+
+    async fn save_audit_attestation(&self, attestation: &AuditAttestation) -> Result<i64> {
+        let conn = self.get_conn().await?;
+
+        conn.execute(
+            "INSERT INTO audit_attestations (
+                attestation_uuid,
+                subject_event_uuid,
+                attestor_id,
+                attestor_public_key,
+                decision,
+                reason,
+                created_at,
+                signature
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                attestation.attestation_uuid.to_string(),
+                attestation.subject_event_uuid.to_string(),
+                attestation.attestor_id.clone(),
+                attestation.attestor_public_key.clone(),
+                attestation.decision.clone(),
+                attestation.reason.clone(),
+                Monitor::timestamp_to_i64(attestation.created_at),
+                attestation.signature.clone(),
+            ],
+        )
+        .await?;
+
+        Ok(conn.last_insert_rowid())
+    }
+
+    async fn list_audit_attestations(
+        &self,
+        subject_event_uuid: Uuid,
+    ) -> Result<Vec<AuditAttestation>> {
+        let conn = self.get_conn().await?;
+        let mut rows = conn
+            .query(
+                "SELECT
+                    id,
+                    attestation_uuid,
+                    subject_event_uuid,
+                    attestor_id,
+                    attestor_public_key,
+                    decision,
+                    reason,
+                    created_at,
+                    signature
+                 FROM audit_attestations
+                 WHERE subject_event_uuid = ?
+                 ORDER BY created_at DESC, id DESC",
+                params![subject_event_uuid.to_string()],
+            )
+            .await?;
+
+        let mut attestations = Vec::new();
+        while let Some(row) = rows.next().await? {
+            attestations.push(Self::map_audit_attestation_row(&row)?);
+        }
+
+        Ok(attestations)
     }
 }
