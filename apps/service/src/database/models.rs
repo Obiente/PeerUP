@@ -17,16 +17,16 @@ pub struct Monitor {
     pub enabled: bool,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
-    
+
     /// Visibility mode (Public or Private)
     pub visibility: MonitorVisibility,
-    
+
     /// Public domain (for public monitors, e.g., "google.com")
     pub public_domain: Option<String>,
-    
+
     /// Display name for public monitors
     pub public_display_name: Option<String>,
-    
+
     /// Owner peer ID (for private monitors)
     pub owner_peer_id: Option<String>,
 }
@@ -69,13 +69,31 @@ impl Monitor {
             owner_peer_id: None,
         }
     }
-    
+
+    /// Derive a deterministic UUID v5 for a public monitor from its domain.
+    /// All peers that see the same domain will produce the identical UUID,
+    /// so results can be aggregated across the network without coordination.
+    pub fn uuid_for_public_domain(domain: &str) -> Uuid {
+        // Fixed application namespace: b"uppe-public-mons" (16 bytes)
+        const NS: Uuid = Uuid::from_bytes([
+            0x75, 0x70, 0x70, 0x65, 0x2d, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x2d, 0x6d, 0x6f,
+            0x6e, 0x73,
+        ]);
+        Uuid::new_v5(&NS, domain.to_lowercase().trim_end_matches('/').as_bytes())
+    }
+
     /// Create a new public monitor
-    pub fn new_public(name: String, target: String, check_type: String, domain: String, display_name: String) -> Self {
+    pub fn new_public(
+        name: String,
+        target: String,
+        check_type: String,
+        domain: String,
+        display_name: String,
+    ) -> Self {
         let now = SystemTime::now();
         Self {
             id: None,
-            uuid: Uuid::new_v4(),
+            uuid: Monitor::uuid_for_public_domain(&domain),
             name,
             target,
             check_type,
@@ -90,67 +108,15 @@ impl Monitor {
             owner_peer_id: None,
         }
     }
-    
-    /// Create a new private monitor with owner (peer-assisted)
-    pub fn new_private(name: String, target: String, check_type: String, owner_peer_id: String) -> Self {
-        let now = SystemTime::now();
-        Self {
-            id: None,
-            uuid: Uuid::new_v4(),
-            name,
-            target,
-            check_type,
-            interval_seconds: 30,
-            timeout_seconds: 10,
-            enabled: true,
-            created_at: now,
-            updated_at: now,
-            visibility: MonitorVisibility::Private,
-            public_domain: None,
-            public_display_name: None,
-            owner_peer_id: Some(owner_peer_id),
-        }
-    }
-    
-    /// Create a new internal monitor (owner-only, secrets)
-    pub fn new_internal(name: String, target: String, check_type: String, owner_peer_id: String) -> Self {
-        let now = SystemTime::now();
-        Self {
-            id: None,
-            uuid: Uuid::new_v4(),
-            name,
-            target,
-            check_type,
-            interval_seconds: 30,
-            timeout_seconds: 10,
-            enabled: true,
-            created_at: now,
-            updated_at: now,
-            visibility: MonitorVisibility::Internal,
-            public_domain: None,
-            public_display_name: None,
-            owner_peer_id: Some(owner_peer_id),
-        }
-    }
-    
+
     /// Check if this is a public monitor
     pub fn is_public(&self) -> bool {
         matches!(self.visibility, MonitorVisibility::Public)
     }
-    
+
     /// Check if this is a private monitor (peer-assisted)
     pub fn is_private(&self) -> bool {
         matches!(self.visibility, MonitorVisibility::Private)
-    }
-    
-    /// Check if this is an internal monitor (owner-only, secrets)
-    pub fn is_internal(&self) -> bool {
-        matches!(self.visibility, MonitorVisibility::Internal)
-    }
-    
-    /// Check if monitor requires peer orchestration
-    pub fn requires_orchestration(&self) -> bool {
-        matches!(self.visibility, MonitorVisibility::Public | MonitorVisibility::Private)
     }
 
     /// Convert SystemTime to Unix timestamp
@@ -300,4 +266,40 @@ pub struct NetworkStats {
     pub checks_performed: i64,
     pub checks_received: i64,
     pub bandwidth_used_mb: i64,
+}
+
+/// Signed audit event persisted in the append-only event log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub id: Option<i64>,
+    pub event_uuid: Uuid,
+    pub event_type: String,
+    pub schema_version: i32,
+    pub created_at: SystemTime,
+    pub actor_id: String,
+    pub actor_public_key: Vec<u8>,
+    pub resource_type: String,
+    pub resource_id: String,
+    pub parent_event_uuid: Option<Uuid>,
+    pub payload_json: String,
+    pub payload_hash: String,
+    pub capability_id: Option<String>,
+    pub delegated_by: Option<String>,
+    pub expires_at: Option<SystemTime>,
+    pub context_json: Option<String>,
+    pub signature: Vec<u8>,
+}
+
+/// Peer attestation over a previously stored audit event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditAttestation {
+    pub id: Option<i64>,
+    pub attestation_uuid: Uuid,
+    pub subject_event_uuid: Uuid,
+    pub attestor_id: String,
+    pub attestor_public_key: Vec<u8>,
+    pub decision: String,
+    pub reason: Option<String>,
+    pub created_at: SystemTime,
+    pub signature: Vec<u8>,
 }

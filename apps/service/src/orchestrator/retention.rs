@@ -26,11 +26,7 @@ pub struct RetentionPolicy {
 
 impl Default for RetentionPolicy {
     fn default() -> Self {
-        Self {
-            private_result_days: 7,
-            public_result_days: 30,
-            peer_result_days: 30,
-        }
+        Self { private_result_days: 7, public_result_days: 30, peer_result_days: 30 }
     }
 }
 
@@ -67,10 +63,7 @@ impl RetentionCleanup {
 
         let peer_count = self.database.cleanup_expired_peer_results().await?;
 
-        info!(
-            "Retention cleanup completed: {} peer results deleted",
-            peer_count
-        );
+        info!("Retention cleanup completed: {} peer results deleted", peer_count);
 
         Ok(())
     }

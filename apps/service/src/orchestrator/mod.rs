@@ -1,3 +1,4 @@
+pub mod admin_trust;
 /// Orchestrator module - coordinates all components
 ///
 /// The orchestrator is the core coordinator that:
@@ -12,11 +13,8 @@
 /// ## Private Monitor Orchestration
 /// The `private` submodule provides peer-assisted monitoring with encryption
 /// for private services, coordinating helper peers and result synchronization.
-
 pub mod distributed;
 pub mod private;
-pub mod admission;
-pub mod admin_trust;
 pub mod retention;
 
 #[cfg(test)]
@@ -27,7 +25,7 @@ pub use private::PrivateMonitorOrchestrator;
 pub use retention::{RetentionCleanup, RetentionPolicy};
 
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -36,7 +34,10 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::crypto::{KeyPair, load_or_generate_keypair, sign_result, verify_result, encrypt_result_for_owner};
+use crate::crypto::{
+    KeyPair, decrypt_result_for_owner, encrypt_result_for_owner, load_or_generate_keypair,
+    sign_result, verify_result,
+};
 use crate::database::models::{NetworkStats, Peer};
 use crate::database::{Database, DatabaseImpl, initialize_database};
 use crate::monitoring::checker::CheckType;
@@ -57,12 +58,13 @@ struct HelperAssignmentInfo {
 pub struct Orchestrator {
     #[allow(dead_code)] // Will be used for runtime configuration changes
     config: Arc<Config>,
+    actor_id: String,
     database: Arc<dyn Database>,
     keypair: Arc<KeyPair>,
     executor: Arc<MonitoringExecutor>,
     p2p_network: Arc<P2PNetwork>,
     p2p_event_rx: Option<mpsc::Receiver<crate::p2p::P2PEvent>>,
-    task_handles: Vec<tokio::task::JoinHandle<()>>,
+    task_handles: HashMap<Uuid, tokio::task::JoinHandle<()>>,
     #[allow(dead_code)] // Background task handle kept alive
     retention_cleanup_handle: Option<tokio::task::JoinHandle<()>>,
     #[allow(dead_code)] // Kept alive to manage private monitor helper assignments
@@ -114,9 +116,18 @@ impl Orchestrator {
         )?);
 
         // Create P2P network with configuration
+        // Derive a stable libp2p peer identity from the same Ed25519 secret
+        // used for the app-layer peer ID, so the libp2p peer ID is persistent
+        // across restarts and eliminates the root cause of the dual-identity
+        // and self-healing issues.
         let mut builder = peerup::node::NodeConfig::builder()
             .port_range(config.peerup.port_range)
             .bootstrap_peers(config.peerup.bootstrap_peers.clone());
+
+        {
+            let mut secret = keypair.signing_key.to_bytes();
+            builder = builder.identity_from_ed25519_secret(&mut secret)?;
+        }
 
         // Conditionally enable/disable features
         if config.peerup.enable_mdns {
@@ -169,17 +180,20 @@ impl Orchestrator {
 
         Ok(Self {
             config,
+            actor_id: peer_id,
             database,
             keypair,
             executor,
             p2p_network: Arc::new(p2p_network),
             p2p_event_rx,
-            task_handles: Vec::new(),
+            task_handles: HashMap::new(),
             retention_cleanup_handle: Some(retention_handle),
-            private_orchestrator: None, // Will be set in run()
+            private_orchestrator: None,     // Will be set in run()
             distributed_orchestrator: None, // Will be set in run()
             helper_assignments: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            rate_limiter: Arc::new(tokio::sync::RwLock::new(private::PrivateMonitorRateLimiter::new())),
+            rate_limiter: Arc::new(tokio::sync::RwLock::new(
+                private::PrivateMonitorRateLimiter::new(),
+            )),
         })
     }
 
@@ -193,7 +207,7 @@ impl Orchestrator {
         let (result_tx, mut result_rx) = mpsc::channel::<CheckResult>(100);
 
         // Create scheduler (mutable for dynamic monitor reloading)
-        let mut scheduler = MonitoringScheduler::new(self.executor.clone(), result_tx.clone());
+        let scheduler = MonitoringScheduler::new(self.executor.clone(), result_tx.clone());
 
         // Load monitors from database and schedule them
         info!("Loading monitors from database...");
@@ -201,16 +215,24 @@ impl Orchestrator {
         info!("Found {} enabled monitors", monitors.len());
 
         // Create monitor visibility map to check before sharing results (mutable for dynamic updates)
-        let mut monitor_visibility: HashMap<Uuid, crate::database::models::MonitorVisibility> = HashMap::new();
+        let mut monitor_visibility: HashMap<Uuid, crate::database::models::MonitorVisibility> =
+            HashMap::new();
+        // Map: normalised target URL → local monitor UUID, for public monitors.
+        // Used to remap incoming gossipsub results from other peers (which carry
+        // their own UUIDs) to our local monitor UUID so the frontend can
+        // aggregate results and peer counts correctly.
+        let mut target_to_local_uuid: HashMap<String, Uuid> = HashMap::new();
         for m in &monitors {
             monitor_visibility.insert(m.uuid, m.visibility.clone());
+            if m.is_public() {
+                target_to_local_uuid.insert(m.target.trim_end_matches('/').to_lowercase(), m.uuid);
+            }
         }
 
         // Run Owner Sync if enabled (attempts to sync encrypted private results from DHT)
         // This is optional and will log warnings on failure without stopping startup
         if self.p2p_network.is_enabled() {
             info!("Attempting Owner Sync from DHT...");
-            let owner_secret_key = self.keypair.x25519_secret_bytes();
             let owner_pubkey = self.keypair.x25519_public_key();
             let private_orchestrator = PrivateMonitorOrchestrator::new(
                 self.database.clone(),
@@ -224,10 +246,8 @@ impl Orchestrator {
                 warn!("Failed to initialize private monitor orchestrator: {}", e);
             }
 
-            match private_orchestrator.sync_owner_results_from_dht(&owner_secret_key).await {
-                Ok(()) => info!("Owner sync completed successfully"),
-                Err(e) => warn!("Owner sync failed (this is normal on first run): {}", e),
-            }
+            // NOTE: DHT sync is deferred to the first PeerConnected event so that
+            // routing peers are available before we issue Kademlia queries.
 
             // Keep the orchestrator alive for dynamic helper assignment
             self.private_orchestrator = Some(Arc::new(private_orchestrator));
@@ -247,31 +267,40 @@ impl Orchestrator {
             info!("Skipping Owner Sync - P2P network disabled");
         }
 
-        // Convert database monitors to scheduler configs
-        let monitor_configs: Vec<MonitorConfig> = monitors
-            .into_iter()
-            .map(|m| {
-                let check_type = match m.check_type.as_str() {
-                    "http" => CheckType::Http,
-                    "https" => CheckType::Https,
-                    "tcp" => CheckType::Tcp,
-                    "icmp" => CheckType::Icmp,
-                    _ => CheckType::Http,
-                };
-
-                MonitorConfig {
-                    id: m.uuid,
-                    target: m.target,
-                    check_type,
-                    interval_seconds: m.interval_seconds,
-                    enabled: m.enabled,
-                }
-            })
-            .collect();
+        // Convert database monitors to scheduler configs (with staggered phase offsets)
+        let my_peer_id = self.keypair.public_key_hex();
+        let mut monitor_configs: Vec<MonitorConfig> = Vec::with_capacity(monitors.len());
+        for m in monitors {
+            let check_type = match m.check_type.as_str() {
+                "http" => CheckType::Http,
+                "https" => CheckType::Https,
+                "tcp" => CheckType::Tcp,
+                "icmp" => CheckType::Icmp,
+                _ => CheckType::Http,
+            };
+            let phase_offset_secs = if let (Some(orch), Some(domain)) =
+                (&self.distributed_orchestrator, m.public_domain.as_deref())
+            {
+                orch.get_peer_phase_offset(domain, &my_peer_id).await
+            } else {
+                0
+            };
+            monitor_configs.push(MonitorConfig {
+                id: m.uuid,
+                target: m.target,
+                check_type,
+                interval_seconds: m.interval_seconds,
+                enabled: m.enabled,
+                phase_offset_secs,
+            });
+        }
 
         // Schedule all monitors
         info!("Scheduling monitors...");
-        self.task_handles = scheduler.schedule_monitors(monitor_configs);
+        self.task_handles = monitor_configs
+            .into_iter()
+            .map(|c| (c.id, scheduler.schedule_monitor(c)))
+            .collect();
 
         // Process results in a loop
         info!("Orchestrator started successfully - processing monitoring results");
@@ -292,13 +321,43 @@ impl Orchestrator {
         let mut last_helper_maintenance = Instant::now();
         let helper_maintenance_interval = Duration::from_secs(60); // Check helper health every minute
 
+        // Track last reconnect attempt (for bootstrap peer re-dial).
+        // On startup we retry with short delays so helper assignment doesn't
+        // have to wait 30 s before a first peer is discovered.
+        // Schedule: 5 s → 10 s → 20 s → 30 s (steady-state).
+        let reconnect_interval = Duration::from_secs(30);
+        let mut startup_reconnect_delays: VecDeque<Duration> = VecDeque::from([
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+            Duration::from_secs(20),
+        ]);
+        let mut current_reconnect_delay =
+            startup_reconnect_delays.pop_front().unwrap_or(reconnect_interval);
+        let mut last_reconnect_attempt = Instant::now();
+        // Periodic presence re-announce: even without new connections, re-broadcast
+        // so any peer that came up while we were already running can discover us.
+        let mut last_periodic_announce = Instant::now();
+        let periodic_announce_interval = Duration::from_secs(300); // every 5 min
+
         // P2P/network stats tracking
         let mut connected_peers: HashSet<String> = HashSet::new();
         let mut total_peers_seen: HashSet<String> = HashSet::new();
+        // Only peers that have announced themselves as uppe-service nodes are eligible
+        // as helper candidates.  Plain peerup routing/relay nodes are excluded.
+        let mut uppe_service_peers: HashSet<String> = HashSet::new();
         let mut checks_performed: i64 = 0;
         let mut checks_received: i64 = 0;
         let mut last_stats_persist = Instant::now();
         let stats_persist_interval = Duration::from_secs(5);
+
+        // Deferred DHT sync — triggered once on first peer connection.
+        let mut dht_sync_done = false;
+
+        // Name consensus: domain → { name → vote_count }
+        let mut domain_name_votes: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, usize>,
+        > = std::collections::HashMap::new();
 
         // Use the P2P event receiver that was returned from start()
         let mut p2p_event_rx = self.p2p_event_rx.take();
@@ -326,10 +385,10 @@ impl Orchestrator {
                         // This is a helper assignment - encrypt and send the result back to the owner
                         let assignment_clone = assignment.clone();
                         drop(assignments); // Release the lock
-                        
-                        info!("Encrypting helper result for monitor {} and owner {}", 
+
+                        info!("Encrypting helper result for monitor {} and owner {}",
                               signed_result.monitor_id, assignment_clone.owner_peer_id);
-                        
+
                         match encrypt_result_for_owner(
                             &signed_result,
                             &assignment_clone.owner_public_key,
@@ -357,6 +416,16 @@ impl Orchestrator {
                     // Save to database
                     if let Err(e) = self.database.save_result(&signed_result).await {
                         error!("Failed to save result to database: {}", e);
+                    } else if let Err(e) = crate::audit::record_local_result_event(
+                        self.database.as_ref(),
+                        self.keypair.as_ref(),
+                        &self.actor_id,
+                        "local_scheduler",
+                        &signed_result,
+                    )
+                    .await
+                    {
+                        warn!("Failed to record local result audit event: {}", e);
                     }
 
                     // Update stats for locally performed check
@@ -421,6 +490,30 @@ impl Orchestrator {
 
                             total_peers_seen.insert(peer_id.clone());
 
+                            // A peer delivering gossipsub results is reachable AND running
+                            // uppe-service.  Populate the tracking sets in case
+                            // ConnectionEstablished / NodeAnnounced events were missed
+                            // (race at startup, or the peer was already connected).
+                            {
+                                let newly_connected = connected_peers.insert(peer_id.clone());
+                                let newly_uppe = uppe_service_peers.insert(peer_id.clone());
+                                if newly_connected || newly_uppe {
+                                    if let Some(private_orch) = &self.private_orchestrator {
+                                        if newly_connected {
+                                            private_orch.handle_peer_connected(peer_id.clone()).await;
+                                        }
+                                        private_orch.update_uppe_service_peers(uppe_service_peers.clone()).await;
+                                        if let Err(e) = private_orch.retry_unhelped_monitors().await {
+                                            tracing::debug!("retry_unhelped from ResultReceived: {}", e);
+                                        }
+                                    }
+                                    tracing::debug!(
+                                        peer = %peer_id,
+                                        "Discovered uppe-service peer via gossipsub result"
+                                    );
+                                }
+                            }
+
                             // Convert P2P result to database model
                             if let Some(mut db_result) = crate::database::models::PeerResult::from_p2p_result(&result) {
                                 // Verify signature if public key is available
@@ -479,14 +572,129 @@ impl Orchestrator {
                                 if let Err(e) = self.database.save_peer_result(&db_result).await {
                                     error!("Failed to save peer result: {}", e);
                                 } else {
+                                    match crate::audit::record_peer_result_event(
+                                        self.database.as_ref(),
+                                        self.keypair.as_ref(),
+                                        &self.actor_id,
+                                        "p2p_gossipsub",
+                                        &db_result,
+                                    )
+                                    .await
+                                    {
+                                        Ok(event_id) => {
+                                            let reason = if result.public_key.is_none() {
+                                                Some("missing public key")
+                                            } else if verified {
+                                                Some("signature valid")
+                                            } else {
+                                                Some("signature invalid")
+                                            };
+                                            if let Err(e) = crate::audit::record_result_verification_attestation(
+                                                self.database.as_ref(),
+                                                self.keypair.as_ref(),
+                                                &self.actor_id,
+                                                event_id,
+                                                verified,
+                                                reason,
+                                            )
+                                            .await
+                                            {
+                                                warn!("Failed to record peer result verification attestation: {}", e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to record peer result audit event: {}", e);
+                                        }
+                                    }
                                     let status = if verified { "verified" } else { "unverified" };
                                     debug!("Successfully saved {} peer result from {}", status, peer_id);
+                                }
+
+                                // For public monitors, also write to monitor_results so the
+                                // Go API server can serve the result with the correct peer ID.
+                                if let Some(vis) = monitor_visibility.get(&result.result.monitor_id) {
+                                    use crate::database::models::MonitorVisibility;
+                                    if matches!(vis, MonitorVisibility::Public) {
+                                        if let Err(e) = self.database.save_result(&result.result).await {
+                                            warn!("Failed to mirror public peer result to monitor_results: {}", e);
+                                        } else if let Err(e) = crate::audit::record_local_result_event(
+                                            self.database.as_ref(),
+                                            self.keypair.as_ref(),
+                                            &self.actor_id,
+                                            "peer_public_mirror",
+                                            &result.result,
+                                        )
+                                        .await
+                                        {
+                                            warn!("Failed to record mirrored peer result audit event: {}", e);
+                                        }
+                                    }
+                                } else {
+                                    // Result UUID is unknown locally — try to match by target URL
+                                    // (other peers monitoring the same service use their own UUIDs).
+                                    let norm_target = result.result.target.trim_end_matches('/').to_lowercase();
+                                    if let Some(&local_uuid) = target_to_local_uuid.get(&norm_target) {
+                                        // Remap result to our local monitor UUID before saving
+                                        let mut remapped = result.result.clone();
+                                        remapped.monitor_id = local_uuid;
+                                        if let Err(e) = self.database.save_result(&remapped).await {
+                                            warn!("Failed to save remapped peer result for target {}: {}", norm_target, e);
+                                        } else if let Err(e) = crate::audit::record_local_result_event(
+                                            self.database.as_ref(),
+                                            self.keypair.as_ref(),
+                                            &self.actor_id,
+                                            "peer_public_remapped",
+                                            &remapped,
+                                        )
+                                        .await
+                                        {
+                                            warn!("Failed to record remapped peer result audit event: {}", e);
+                                        } else {
+                                            debug!("Remapped peer result for {} to local UUID {}", norm_target, local_uuid);
+                                        }
+                                    }
                                 }
 
                                 // Update stats for received results
                                 checks_received += 1;
                             } else {
                                 warn!("Received peer result without signature from {}", peer_id);
+                            }
+                        }
+                        P2PEvent::NodeAnnounced { libp2p_peer_id, app_peer_id: _ } => {
+                            let is_new = !uppe_service_peers.contains(&libp2p_peer_id);
+                            if is_new {
+                                info!(peer = %libp2p_peer_id, "uppe-service peer announced");
+                                uppe_service_peers.insert(libp2p_peer_id.clone());
+                            }
+                            // Update the private orchestrator's allowed helper set
+                            if let Some(private_orch) = &self.private_orchestrator {
+                                private_orch.update_uppe_service_peers(uppe_service_peers.clone()).await;
+                                // Retry any monitors that previously had no helpers —
+                                // a newly announced peer may now be eligible.
+                                if is_new {
+                                    if let Err(e) = private_orch.retry_unhelped_monitors().await {
+                                        tracing::warn!("retry_unhelped after announce failed: {}", e);
+                                    }
+                                }
+                            }
+                            // Broadcast all our public monitor groups so this new peer can
+                            // discover and auto-join them.
+                            if is_new {
+                                if let Some(dist_orch) = &self.distributed_orchestrator {
+                                    if let Err(e) = dist_orch.broadcast_all_for_discovery().await {
+                                        tracing::debug!("broadcast_all_for_discovery failed: {}", e);
+                                    }
+                                }
+                            }
+                            // Mutual re-announce: respond with our own presence so the announcing
+                            // peer learns we are also a uppe-service node.  Gossipsub does not
+                            // replay history — the new peer subscribed to /uppe/announce/v1 AFTER
+                            // we last published, so they never received our announcement.
+                            if is_new && p2p_network.is_enabled() {
+                                let _ = p2p_network.send_command(
+                                    crate::p2p::messages::P2PCommand::AnnouncePresence
+                                ).await;
                             }
                         }
                         P2PEvent::PeerConnected(peer_id) => {
@@ -505,36 +713,93 @@ impl Orchestrator {
                             // Update private orchestrator with new peer
                             if let Some(private_orch) = &self.private_orchestrator {
                                 private_orch.handle_peer_connected(peer_id.clone()).await;
+
+                                // Clear private monitors from the "already assigned" set
+                                // if they have no active/pending helpers.
+                                let active = private_orch.get_assigned_monitor_uuids().await;
+                                assigned_private_monitors.retain(|uuid| active.contains(uuid));
+
+                                // Immediately retry any unhelped monitors now that a new peer
+                                // is online — don't wait for the 30-second reload tick.
+                                if let Err(e) = private_orch.retry_unhelped_monitors().await {
+                                    tracing::warn!("retry_unhelped after peer connect failed: {}", e);
+                                }
+                            }
+
+                            // Re-broadcast our own announcement so this peer learns we are uppe-service
+                            if p2p_network.is_enabled() {
+                                let _ = p2p_network.send_command(
+                                    crate::p2p::messages::P2PCommand::AnnouncePresence
+                                ).await;
                             }
 
                             let peer_model = Peer::new_online(peer_id.clone(), now);
                             if let Err(e) = self.database.upsert_peer(&peer_model).await {
                                 warn!("Failed to upsert peer {}: {}", peer_id, e);
                             }
+
+                            // First peer connection: trigger deferred DHT result sync.
+                            // We spawn it so the event loop stays responsive.
+                            if !dht_sync_done {
+                                dht_sync_done = true;
+                                if let Some(private_orch) = &self.private_orchestrator {
+                                    let orch = Arc::clone(private_orch);
+                                    let key = self.keypair.x25519_secret_bytes();
+                                    tokio::spawn(async move {
+                                        // Wait a moment for DHT routing to stabilise
+                                        tokio::time::sleep(Duration::from_secs(4)).await;
+                                        match orch.sync_owner_results_from_dht(&key).await {
+                                            Ok(()) => info!("Deferred DHT sync completed"),
+                                            Err(e) => warn!("Deferred DHT sync failed: {}", e),
+                                        }
+                                    });
+                                }
+                            }
                         }
                         P2PEvent::PeerDisconnected(peer_id) => {
                             info!(target: "uppe::audit", peer = %peer_id, "Peer disconnected");
 
                             connected_peers.remove(&peer_id);
+                            uppe_service_peers.remove(&peer_id);
+                            // Re-arm DHT sync so the next reconnect after a full
+                            // network partition triggers encrypted-result recovery.
+                            if connected_peers.is_empty() {
+                                dht_sync_done = false;
+                            }
                             #[allow(unused_must_use)]
                             {
                                 crate::tui::bus::publish_peers(connected_peers.iter().cloned().collect(), SystemTime::now());
                             }
-                            
+
                             // Update private orchestrator with disconnected peer
                             if let Some(private_orch) = &self.private_orchestrator {
                                 private_orch.handle_peer_disconnected(&peer_id).await;
                             }
-                            
+
                             if let Err(e) = self.database.mark_peer_offline(&peer_id, SystemTime::now()).await {
                                 warn!("Failed to mark peer offline {}: {}", peer_id, e);
+                            }
+
+                            // Remove disconnected peer from all public monitor groups
+                            if let Some(dist_orch) = &self.distributed_orchestrator {
+                                for group in dist_orch.get_all_groups().await {
+                                    if group.participating_peers.contains(&peer_id) {
+                                        if let Err(e) = dist_orch.handle_peer_leave(group.domain.clone(), peer_id.clone()).await {
+                                            tracing::debug!("handle_peer_leave {}/{}: {}", group.domain, peer_id, e);
+                                        }
+                                    }
+                                }
                             }
                         }
                         P2PEvent::Started { peer_id } => {
                             info!("P2P network started with peer ID: {}", peer_id);
                         }
                         P2PEvent::Error(err) => {
-                            error!("P2P error: {}", err);
+                            if err.contains("Duplicate") || err.contains("NoPeersSubscribedToTopic") {
+                                tracing::debug!("P2P publish skipped (expected): {}", err);
+                            } else {
+                                error!("P2P error: {}", err);
+                            }
                         }
                         P2PEvent::HelperAssignmentRequested { from_peer, request } => {
                             info!(
@@ -547,13 +812,14 @@ impl Orchestrator {
                                 // Check if we have capacity for more assignments
                                 let current_assignments = self.helper_assignments.read().await.len();
                                 let max_assignments = 10; // Configurable limit
-                                
+
                                 if current_assignments >= max_assignments {
                                     warn!("Rejecting helper assignment - at capacity ({}/{})", current_assignments, max_assignments);
 
                                     let rejection = crate::p2p::messages::HelperAssignmentResponse::Rejected {
                                         monitor_uuid: request.monitor_uuid.clone(),
                                         reason: format!("Helper at capacity ({}/{})", current_assignments, max_assignments),
+                                        owner_libp2p_peer_id: request.owner_libp2p_peer_id.clone(),
                                     };
 
                                     if let Err(e) = p2p_network.send_command(
@@ -577,6 +843,7 @@ impl Orchestrator {
                                         let rejection = crate::p2p::messages::HelperAssignmentResponse::Rejected {
                                             monitor_uuid: request.monitor_uuid.clone(),
                                             reason: "Owner rate limit exceeded".to_string(),
+                                            owner_libp2p_peer_id: request.owner_libp2p_peer_id.clone(),
                                         };
                                         if let Err(e) = p2p_network.send_command(
                                             crate::p2p::messages::P2PCommand::SendHelperResponse(rejection)
@@ -593,7 +860,7 @@ impl Orchestrator {
                                     owner_peer_id: request.owner_peer_id.clone(),
                                     owner_public_key: request.owner_public_key,
                                 };
-                                
+
                                 {
                                     let mut assignments = self.helper_assignments.write().await;
                                     assignments.insert(monitor_id, assignment_info);
@@ -614,11 +881,12 @@ impl Orchestrator {
                                     check_type,
                                     interval_seconds: request.interval_seconds,
                                     enabled: true,
+                                    phase_offset_secs: request.check_offset_seconds,
                                 };
 
                                 // Schedule this helper monitor
                                 let handle = scheduler.schedule_monitor(monitor_config);
-                                self.task_handles.push(handle);
+                                self.task_handles.insert(monitor_id, handle);
 
                                 info!(
                                     "Successfully scheduled helper monitoring for {} (owner: {})",
@@ -629,6 +897,7 @@ impl Orchestrator {
                                 let acceptance = crate::p2p::messages::HelperAssignmentResponse::Accepted {
                                     monitor_uuid: request.monitor_uuid.clone(),
                                     helper_peer_id: self.keypair.public_key_hex(),
+                                    owner_libp2p_peer_id: request.owner_libp2p_peer_id.clone(),
                                 };
                                 if let Err(e) = p2p_network.send_command(
                                     crate::p2p::messages::P2PCommand::SendHelperResponse(acceptance)
@@ -647,16 +916,70 @@ impl Orchestrator {
 
                             // Parse the monitor UUID
                             if let Ok(monitor_id) = uuid::Uuid::parse_str(&encrypted_result.monitor_uuid) {
+                                // If this node is a helper for this monitor (not the owner),
+                                // the gossipsub message was looped back to us — ignore it.
+                                let we_are_helper = self.helper_assignments.read().await.contains_key(&monitor_id);
+                                if we_are_helper {
+                                    debug!(
+                                        monitor = %monitor_id,
+                                        "Ignoring looped-back encrypted result (we are the helper, not the owner)"
+                                    );
+                                    // skip — don't try to decrypt with our own key
+                                }
+                                else {
                                 // Update helper last_seen if we're the owner
                                 if let Some(private_orch) = &self.private_orchestrator {
                                     private_orch.handle_helper_result(&from_peer).await;
                                 }
-                                
-                                debug!(
-                                    "Encrypted result from helper {} for owner {} (monitor {})",
-                                    from_peer, encrypted_result.owner_peer_id, monitor_id
-                                );
-                                checks_received += 1;
+
+                                // Decrypt and save the result to our local database
+                                let owner_secret_key = self.keypair.x25519_secret_bytes();
+                                match decrypt_result_for_owner::<CheckResult>(
+                                    &encrypted_result,
+                                    &owner_secret_key,
+                                ) {
+                                    Ok(decrypted) => {
+                                        if let Err(e) = self.database.save_result(&decrypted).await {
+                                            warn!(
+                                                monitor = %monitor_id,
+                                                from = %from_peer,
+                                                "Failed to save decrypted private result: {}",
+                                                e
+                                            );
+                                        } else {
+                                            if let Err(e) = crate::audit::record_local_result_event(
+                                                self.database.as_ref(),
+                                                self.keypair.as_ref(),
+                                                &self.actor_id,
+                                                "helper_decrypted_result",
+                                                &decrypted,
+                                            )
+                                            .await
+                                            {
+                                                warn!(
+                                                    monitor = %monitor_id,
+                                                    "Failed to record decrypted private result audit event: {}",
+                                                    e
+                                                );
+                                            }
+                                            info!(
+                                                monitor = %monitor_id,
+                                                helper = %from_peer,
+                                                "Saved decrypted private result"
+                                            );
+                                            checks_received += 1;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            monitor = %monitor_id,
+                                            from = %from_peer,
+                                            "Failed to decrypt helper result: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                                } // end else (we are not the helper)
                             } else {
                                 warn!("Invalid monitor UUID in encrypted result: {}", encrypted_result.monitor_uuid);
                             }
@@ -686,21 +1009,216 @@ impl Orchestrator {
                                 "Received helper assignment response from peer {}",
                                 from_peer
                             );
-                            
+
                             // Route to private orchestrator
                             if let Some(private_orch) = &self.private_orchestrator {
                                 use crate::p2p::messages::HelperAssignmentResponse;
                                 match *response {
-                                    HelperAssignmentResponse::Accepted { ref monitor_uuid, ref helper_peer_id } => {
-                                        if let Err(e) = private_orch.handle_helper_accepted(monitor_uuid, helper_peer_id).await {
+                                    HelperAssignmentResponse::Accepted { ref monitor_uuid, .. } => {
+                                        // Use the libp2p peer ID (from_peer) rather than the
+                                        // app peer ID from the response payload.  All other
+                                        // helper tracking (uppe_service_peers, assignments,
+                                        // handle_helper_result) uses libp2p IDs, so we must
+                                        // be consistent here to avoid stale-helper false alarms.
+                                        if let Err(e) = private_orch.handle_helper_accepted(monitor_uuid, &from_peer).await {
                                             warn!("Failed to handle helper acceptance: {}", e);
                                         }
                                     }
-                                    HelperAssignmentResponse::Rejected { ref monitor_uuid, ref reason } => {
+                                    HelperAssignmentResponse::Rejected { ref monitor_uuid, ref reason, .. } => {
                                         if let Err(e) = private_orch.handle_helper_rejected(monitor_uuid, &from_peer, reason).await {
                                             warn!("Failed to handle helper rejection: {}", e);
                                         }
                                     }
+                                }
+                            }
+                        }
+                        P2PEvent::PublicMonitorAnnounced {
+                            domain,
+                            display_name,
+                            creator_peer_id,
+                            target,
+                            check_type,
+                            interval_seconds,
+                        } => {
+                            // Skip announcements originating from ourselves so we don't
+                            // accidentally count our own broadcast as a name-consensus vote
+                            // or try to re-join a group we already own.
+                            let our_peer_id = self.keypair.public_key_hex();
+                            if creator_peer_id == our_peer_id {
+                                // nothing to do — we already have this monitor
+                            } else {
+
+                            // --- Name consensus: accumulate votes for this domain's display name ---
+                            {
+                                let votes = domain_name_votes
+                                    .entry(domain.clone())
+                                    .or_default();
+                                *votes.entry(display_name.clone()).or_insert(0) += 1;
+
+                                // Find the name with the most votes
+                                if let Some((leading_name, &leading_count)) =
+                                    votes.iter().max_by_key(|(_, c)| *c)
+                                {
+                                    // Only promote a new name when it has a clear majority
+                                    // (≥ 2 votes ahead of any runner-up, and at least 2 votes)
+                                    let runner_up = votes
+                                        .iter()
+                                        .filter(|(n, _)| *n != leading_name)
+                                        .map(|(_, c)| *c)
+                                        .max()
+                                        .unwrap_or(0);
+                                    if leading_count >= 2 && leading_count > runner_up + 1 {
+                                        // Update stored display name if it differs
+                                        let monitor_uuid = crate::database::models::Monitor::uuid_for_public_domain(&domain);
+                                        if let Ok(Some(mut existing)) =
+                                            self.database.get_monitor_by_uuid(monitor_uuid).await
+                                        {
+                                            if existing.public_display_name.as_deref() != Some(leading_name.as_str()) {
+                                                info!(
+                                                    domain = %domain,
+                                                    old_name = ?existing.public_display_name,
+                                                    new_name = %leading_name,
+                                                    votes = leading_count,
+                                                    "Updating public monitor display name via consensus"
+                                                );
+                                                existing.public_display_name = Some(leading_name.clone());
+                                                if let Err(e) = self.database.save_monitor(&existing).await {
+                                                    warn!("Failed to update consensus display name for {}: {}", domain, e);
+                                                } else if let Err(e) = crate::audit::record_monitor_event(
+                                                    self.database.as_ref(),
+                                                    self.keypair.as_ref(),
+                                                    &self.actor_id,
+                                                    "updated",
+                                                    &existing,
+                                                )
+                                                .await
+                                                {
+                                                    warn!("Failed to record consensus monitor update audit event: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some(dist_orch) = &self.distributed_orchestrator {
+                                // Record announcing peer in the group + cast their schedule vote
+                                if let Err(e) = dist_orch.handle_peer_join(domain.clone(), creator_peer_id.clone()).await {
+                                    tracing::debug!("handle_peer_join {}/{}: {}", domain, creator_peer_id, e);
+                                }
+                                let vote = peerup::distributed::OrchestrationVote {
+                                    domain: domain.clone(),
+                                    schedule: peerup::distributed::OrchestrationSchedule {
+                                        interval_seconds,
+                                        assignments: Vec::new(),
+                                    },
+                                    voter_peer_id: creator_peer_id.clone(),
+                                    signature: String::new(),
+                                    public_key: None,
+                                    timestamp: chrono::Utc::now().timestamp(),
+                                };
+                                if let Err(e) = dist_orch.handle_vote(vote).await {
+                                    tracing::debug!("handle_vote {}: {}", domain, e);
+                                }
+
+                                // Only join if we don't already track this domain group
+                                if dist_orch.get_group(&domain).await.is_none() {
+                                    info!(
+                                        domain = %domain,
+                                        target = %target,
+                                        creator = %creator_peer_id,
+                                        "Auto-joining public monitor group"
+                                    );
+
+                                    // Build a new public monitor record so this node
+                                    // can independently check the target.
+                                    let mut monitor = crate::database::models::Monitor::new_public(
+                                        format!("{} (community)", display_name),
+                                        target.clone(),
+                                        check_type.clone(),
+                                        domain.clone(),
+                                        display_name.clone(),
+                                    );
+                                    monitor.interval_seconds = interval_seconds;
+
+                                    match self.database.save_monitor(&monitor).await {
+                                        Ok(_) => {
+                                            if let Err(e) = crate::audit::record_monitor_event(
+                                                self.database.as_ref(),
+                                                self.keypair.as_ref(),
+                                                &self.actor_id,
+                                                "created",
+                                                &monitor,
+                                            )
+                                            .await
+                                            {
+                                                warn!("Failed to record auto-joined monitor audit event: {}", e);
+                                            }
+                                            if let Err(e) = dist_orch.handle_new_monitor(&monitor).await {
+                                                warn!(
+                                                    domain = %domain,
+                                                    "Failed to join public monitor group: {}",
+                                                    e
+                                                );
+                                            } else {
+                                                info!(
+                                                    domain = %domain,
+                                                    target = %target,
+                                                    "Joined public monitor group — will be scheduled in next reload tick"
+                                                );
+                                                // Trigger an immediate monitor reload so the
+                                                // new entry is scheduled without waiting 30 s.
+                                                last_monitor_reload =
+                                                    Instant::now()
+                                                        .checked_sub(monitor_reload_interval)
+                                                        .unwrap_or_else(Instant::now);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                domain = %domain,
+                                                "Failed to save auto-joined public monitor: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            } // end else (creator_peer_id != our_peer_id)
+                        }
+                        P2PEvent::PublicMonitorGroupMessage { _from_peer: _, domain, message } => {
+                            if let Some(dist_orch) = &self.distributed_orchestrator {
+                                use peerup::distributed::PublicMonitorMessage;
+                                match *message {
+                                    PublicMonitorMessage::Join { peer_id, .. } => {
+                                        if let Err(e) = dist_orch.handle_peer_join(domain.clone(), peer_id.clone()).await {
+                                            tracing::debug!("handle_peer_join {}/{}: {}", domain, peer_id, e);
+                                        }
+                                    }
+                                    PublicMonitorMessage::Leave { peer_id, .. } => {
+                                        if let Err(e) = dist_orch.handle_peer_leave(domain.clone(), peer_id.clone()).await {
+                                            tracing::debug!("handle_peer_leave {}/{}: {}", domain, peer_id, e);
+                                        }
+                                    }
+                                    PublicMonitorMessage::ScheduleUpdate { schedule, .. } => {
+                                        // Construct a vote from the received schedule.
+                                        // voter_peer_id is unknown here (ScheduleUpdate
+                                        // doesn't carry it); the from_peer field is the
+                                        // sender's libp2p ID, not their app peer ID, so
+                                        // we leave voter_peer_id empty for now.
+                                        let vote = peerup::distributed::OrchestrationVote {
+                                            domain: domain.clone(),
+                                            schedule,
+                                            voter_peer_id: String::new(),
+                                            signature: String::new(),
+                                            public_key: None,
+                                            timestamp: chrono::Utc::now().timestamp(),
+                                        };
+                                        if let Err(e) = dist_orch.handle_vote(vote).await {
+                                            tracing::debug!("handle_vote {}: {}", domain, e);
+                                        }
+                                    }
+                                    _ => {} // Announce covered by PublicMonitorAnnounced on discovery topic
                                 }
                             }
                         }
@@ -746,35 +1264,48 @@ impl Orchestrator {
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(last_monitor_reload + monitor_reload_interval)) => {
                     if last_monitor_reload.elapsed() >= monitor_reload_interval {
                         debug!("Checking for new or updated monitors...");
-                        
+
                         match self.database.get_enabled_monitors().await {
                             Ok(current_monitors) => {
                                 // Build new monitor configs
-                                let new_monitor_configs: Vec<MonitorConfig> = current_monitors
-                                    .iter()
-                                    .map(|m| {
-                                        let check_type = match m.check_type.as_str() {
-                                            "http" => CheckType::Http,
-                                            "https" => CheckType::Https,
-                                            "tcp" => CheckType::Tcp,
-                                            "icmp" => CheckType::Icmp,
-                                            _ => CheckType::Http,
-                                        };
-
-                                        MonitorConfig {
-                                            id: m.uuid,
-                                            target: m.target.clone(),
-                                            check_type,
-                                            interval_seconds: m.interval_seconds,
-                                            enabled: m.enabled,
-                                        }
-                                    })
-                                    .collect();
+                                let my_peer_id = self.keypair.public_key_hex();
+                                let mut new_monitor_configs: Vec<MonitorConfig> = Vec::with_capacity(current_monitors.len());
+                                for m in &current_monitors {
+                                    let check_type = match m.check_type.as_str() {
+                                        "http" => CheckType::Http,
+                                        "https" => CheckType::Https,
+                                        "tcp" => CheckType::Tcp,
+                                        "icmp" => CheckType::Icmp,
+                                        _ => CheckType::Http,
+                                    };
+                                    let phase_offset_secs = if let (Some(orch), Some(domain)) =
+                                        (&self.distributed_orchestrator, m.public_domain.as_deref())
+                                    {
+                                        orch.get_peer_phase_offset(domain, &my_peer_id).await
+                                    } else {
+                                        0
+                                    };
+                                    new_monitor_configs.push(MonitorConfig {
+                                        id: m.uuid,
+                                        target: m.target.clone(),
+                                        check_type,
+                                        interval_seconds: m.interval_seconds,
+                                        enabled: m.enabled,
+                                        phase_offset_secs,
+                                    });
+                                }
 
                                 // Update monitor visibility map
                                 monitor_visibility.clear();
+                                target_to_local_uuid.clear();
                                 for m in &current_monitors {
                                     monitor_visibility.insert(m.uuid, m.visibility.clone());
+                                    if m.is_public() {
+                                        target_to_local_uuid.insert(
+                                            m.target.trim_end_matches('/').to_lowercase(),
+                                            m.uuid,
+                                        );
+                                    }
                                 }
 
                                 // Check for new private monitors and assign helpers
@@ -783,7 +1314,7 @@ impl Orchestrator {
                                         .iter()
                                         .filter(|m| m.is_private())
                                         .collect();
-                                    
+
                                     for monitor in private_monitors {
                                         // Only assign helpers if this is a NEW private monitor
                                         // Don't reassign on every reload - that causes unnecessary churn
@@ -805,14 +1336,49 @@ impl Orchestrator {
                                 let current_uuids: HashSet<Uuid> = current_monitors.iter().map(|m| m.uuid).collect();
                                 assigned_private_monitors.retain(|uuid| current_uuids.contains(uuid));
 
-                                // Cancel old tasks and reschedule all monitors
-                                for handle in self.task_handles.drain(..) {
-                                    handle.abort();
+                                // Only start tasks for new monitors; abort tasks for removed ones.
+                                // Existing running tasks are left untouched so their timers aren't reset.
+                                let new_config_map: HashMap<Uuid, MonitorConfig> = new_monitor_configs
+                                    .iter()
+                                    .map(|c| (c.id, c.clone()))
+                                    .collect();
+                                let new_uuids: HashSet<Uuid> = new_config_map.keys().copied().collect();
+
+                                // Collect helper-assigned UUIDs so their task handles
+                                // are NOT aborted during reload.  Helper-assigned monitors
+                                // live only in the owner's DB; aborting them here would
+                                // silently stop helper peers from checking private monitors.
+                                let helper_assigned_uuids: HashSet<Uuid> = self
+                                    .helper_assignments
+                                    .read()
+                                    .await
+                                    .keys()
+                                    .copied()
+                                    .collect();
+
+                                // Abort handles for monitors that no longer exist,
+                                // but keep handles for active helper assignments.
+                                self.task_handles.retain(|uuid, handle| {
+                                    if !new_uuids.contains(uuid) && !helper_assigned_uuids.contains(uuid) {
+                                        handle.abort();
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                });
+
+                                // Schedule tasks for monitors not yet running
+                                let currently_running: HashSet<Uuid> =
+                                    self.task_handles.keys().copied().collect();
+                                for uuid in new_uuids.difference(&currently_running) {
+                                    if let Some(config) = new_config_map.get(uuid) {
+                                        let handle = scheduler.schedule_monitor(config.clone());
+                                        self.task_handles.insert(*uuid, handle);
+                                        info!("Scheduled new monitor: {}", uuid);
+                                    }
                                 }
-                                
-                                self.task_handles = scheduler.schedule_monitors(new_monitor_configs.clone());
-                                
-                                info!("Reloaded monitors: {} active", new_monitor_configs.len());
+
+                                info!("Monitors active: {}", self.task_handles.len());
                             }
                             Err(e) => {
                                 error!("Failed to reload monitors: {}", e);
@@ -830,8 +1396,66 @@ impl Orchestrator {
                             if let Err(e) = private_orch.run_maintenance().await {
                                 warn!("Helper maintenance failed: {}", e);
                             }
+                            // After maintenance, clear assignment tracking for monitors
+                            // that ended up with no helpers so the reload loop retries.
+                            let active = private_orch.get_assigned_monitor_uuids().await;
+                            assigned_private_monitors.retain(|uuid| active.contains(uuid));
                         }
                         last_helper_maintenance = Instant::now();
+                    }
+                }
+
+                // Periodic task: Re-dial bootstrap peers when peer count is low.
+                // Uses a startup backoff schedule (5 s → 10 s → 20 s) before settling
+                // at the normal 30 s interval so the first peer is found quickly.
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(last_reconnect_attempt + current_reconnect_delay)) => {
+                    if last_reconnect_attempt.elapsed() >= current_reconnect_delay {
+                        // Re-dial when either we have very few connections OR we have
+                        // connections but none have announced as uppe-service peers.
+                        if p2p_network.is_enabled()
+                            && (connected_peers.len() < 2 || uppe_service_peers.is_empty())
+                        {
+                            debug!(
+                                "Peer count low ({}), re-dialing bootstrap peers (delay={}s)",
+                                connected_peers.len(),
+                                current_reconnect_delay.as_secs()
+                            );
+                            if let Err(e) = p2p_network.send_command(crate::p2p::messages::P2PCommand::DialBootstrapPeers).await {
+                                warn!("Failed to send DialBootstrapPeers: {}", e);
+                            }
+
+                            // If we still have no uppe-service peers, immediately retry
+                            // unhelped monitors — a peer that connected before it announced
+                            // itself may now be eligible.
+                            if uppe_service_peers.is_empty() {
+                                if let Some(private_orch) = &self.private_orchestrator {
+                                    if let Err(e) = private_orch.retry_unhelped_monitors().await {
+                                        tracing::debug!("startup retry_unhelped: {}", e);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Advance through the startup schedule; stay at normal interval once exhausted.
+                        current_reconnect_delay = startup_reconnect_delays
+                            .pop_front()
+                            .unwrap_or(reconnect_interval);
+                        last_reconnect_attempt = Instant::now();
+                    }
+                }
+
+                // Periodic: re-broadcast our node announcement so peers that came
+                // online after our last connection-triggered announce can find us.
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                    last_periodic_announce + periodic_announce_interval
+                )) => {
+                    if last_periodic_announce.elapsed() >= periodic_announce_interval
+                        && p2p_network.is_enabled()
+                    {
+                        let _ = p2p_network.send_command(
+                            crate::p2p::messages::P2PCommand::AnnouncePresence
+                        ).await;
+                        last_periodic_announce = Instant::now();
                     }
                 }
 

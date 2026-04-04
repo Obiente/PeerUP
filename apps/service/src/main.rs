@@ -3,6 +3,7 @@ use std::path;
 
 use clap::{Parser, Subcommand, crate_authors, crate_version};
 
+mod audit;
 mod config;
 mod crypto;
 mod database;
@@ -244,6 +245,24 @@ async fn main() -> anyhow::Result<()> {
                     monitor.interval_seconds = interval;
                     monitor.timeout_seconds = timeout;
                     let id = dbi.save_monitor(&monitor).await?;
+                    match audit::load_local_keypair() {
+                        Ok(keypair) => {
+                            let actor_id = keypair.public_key_hex();
+                            if let Err(e) = audit::record_monitor_event(
+                                &dbi, &keypair, &actor_id, "created", &monitor,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    "Failed to record monitor create audit event: {}",
+                                    e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to load local audit keypair: {}", e);
+                        }
+                    }
                     println!("Added monitor with id {} and uuid {}", id, monitor.uuid);
                 }
             }
